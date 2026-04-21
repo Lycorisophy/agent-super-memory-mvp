@@ -6,7 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # 对话模型（供后续 Agent/编排使用；记忆写入/检索当前仅用嵌入）
+    # 对话模型（编排 store/query）；嵌入模型须与 vector_dim 一致，均可用 .env 覆盖
     ollama_chat_model: str = "qwen3.5:35b-a3b-q8_0"
     ollama_embed_model: str = "qwen3-embedding:8b"
     # Qwen3 嵌入支持 MRL：若设置则须与 vector_dim 一致；不设则使用模型默认满维（8B 多为 4096）
@@ -17,8 +17,8 @@ class Settings(BaseSettings):
 
     milvus_host: str = "localhost"
     milvus_port: str = "19530"
-    milvus_collection: str = "memory_chunks"
-    # qwen3-embedding:8b 默认向量维 4096；若改 ollama_embed_dimensions 请同步修改此值
+    milvus_collection: str = "memory_vectors"
+    # 须与当前嵌入模型输出维度一致（qwen3-embedding:8b 默认多为 4096）
     vector_dim: int = 4096
     milvus_search_ef: int = 64
 

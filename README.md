@@ -1,19 +1,30 @@
 # Agent Super Memory MVP
 
-基于 **Milvus（向量）+ Neo4j（图）** 的长期记忆服务。对外仅暴露 **两个 HTTP 接口**：用户用自然语言说话，服务端组装系统提示词与工具定义，调用 **Ollama 对话模型** 触发 `store_memory` / `query_memory`，由后端执行真实写入与检索，最后返回模型生成的自然语言回复。
+基于 **Milvus（向量）+ Neo4j（图）** 的长期记忆服务。实现与 **[design.md](design.md) v4.0** 及 **[长期记忆系统 v5.0 增量修改文档（相对 v4.0）.md](长期记忆系统%20v5.0%20增量修改文档（相对%20v4.0）.md)** 对齐：**单一 `:Memory` 节点**、**统一中文模板 `content`**；工具 **`memories` + `relations`（temp_id）** 与 **`query_text` + `memory_types`**；v5 起 Neo4j 侧支持可选 **`tense` / `confidence`** 及查询过滤（Milvus 结构不变）。
 
-详细数据模型与工具 Schema 见仓库内 [`design.md`](design.md)。
+对外暴露 **两个 HTTP 接口**：用户自然语言 → 服务端组装系统提示词与工具定义 → **Ollama** 触发 `store_memory` / `query_memory` → 后端写入/检索 → 返回模型自然语言回复。
 
-**检索与存储约定（与 design 原文可能略有侧重）**：写入 Milvus 的 `text` 使用中文句式模板，事实的键与值**原样来自** `store_memory` 入参；**事实查询以 Milvus 向量（`ref_type=fact`）为主**，命中后用 `fact_id` 从 Neo4j 回填 `facts`。旧数据若句式不同，可清空集合后重灌。
+## v4 与旧版不兼容说明
+
+- **Milvus**：集合字段为 `memory_id`、`user_id`、`text`、`embedding`、`timestamp`、`memory_type`（默认集合名 **`memory_vectors`**）。旧版 `memory_chunks`（`chunk_id`/`ref_type`/`ref_id` 等）**不可混用**，请删旧集合或换新 `MILVUS_COLLECTION`。
+- **Neo4j**：使用 `:Memory` + `[:HAS_MEMORY]`；旧版 `:Event`/`:Fact`/`:Knowledge` 相关约束与数据不再由本代码写入。
+- **嵌入**：仓库默认 **`qwen3-embedding:8b`** 与 **`VECTOR_DIM=4096`**（与 `config.py` 一致）。若改用 `nomic-embed-text` 等其它模型，必须在 `.env` 中同时修改 `OLLAMA_EMBED_MODEL` 与 `VECTOR_DIM`（并重建或更换 Milvus 集合）。
+
+## v5.0 增量（相对 v4）
+
+- **Neo4j `Memory`**：可选属性 `tense`（`past` / `present` / `future`）、`confidence`（`real` / `imagined` / `planned`）。v4 已存节点无该属性视为 `null`，**不传查询过滤时行为与 v4 一致**。
+- **`store_memory`**：`memories[]` 每项可带 `tense`、`confidence`。
+- **`query_memory`**：可选参数 `tense`、`confidence`，在 Neo4j 装配阶段过滤；传过滤时 Milvus 候选数会自动放大，减少过滤后条数不足。
+- **返回**：`memories` 每项在节点有值时附带 `tense` / `confidence` 字段。
 
 ## 依赖环境
 
 - **Python** 3.10+
 - **Milvus** 2.x（默认 `localhost:19530`）
 - **Neo4j** 5.x（默认 `bolt://localhost:7687`）
-- **Ollama**（默认 `http://localhost:11434`）
-  - **对话模型**：用于编排工具调用（默认 `qwen3.5:35b-a3b-q8_0`）
-  - **嵌入模型**：写入/检索时向量化（默认 `qwen3-embedding:8b`，向量维默认 **4096**）
+- **Ollama**
+  - **对话模型**（默认 `qwen3.5:35b-a3b-q8_0`，由 `OLLAMA_CHAT_MODEL` 配置）
+  - **嵌入模型**（默认 `qwen3-embedding:8b`，**4096** 维，与 `VECTOR_DIM` 一致）
 
 ## 安装与启动
 
@@ -22,65 +33,49 @@ python -m pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-启动时会连接 Milvus / Neo4j 并初始化集合；若失败，两个对话接口会返回 **503**，日志中有原因说明。
+启动时会连接 Milvus / Neo4j 并初始化集合；若失败，两个对话接口会返回 **503**。
+
+### 最小自检（无外部服务）
+
+```bash
+python tests/test_v4_memory_unit.py
+python tests/test_v5_enums.py
+```
 
 ## 配置
 
-支持环境变量或项目根目录 `.env`（`pydantic-settings`）。常用项如下（名称与代码中 `Settings` 字段对应，环境变量为大写蛇形）：
+支持环境变量或项目根目录 `.env`。常用项：
 
 | 环境变量 | 说明 | 默认值 |
-|----------|------|--------|
+|----------|------|----------------|
 | `OLLAMA_BASE_URL` | Ollama 服务地址 | `http://localhost:11434` |
-| `OLLAMA_CHAT_MODEL` | 对话 / 工具编排模型 | `qwen3.5:35b-a3b-q8_0` |
+| `OLLAMA_CHAT_MODEL` | 对话 / 工具编排 | `qwen3.5:35b-a3b-q8_0` |
 | `OLLAMA_EMBED_MODEL` | 嵌入模型 | `qwen3-embedding:8b` |
-| `OLLAMA_EMBED_DIMENSIONS` | 嵌入输出维度（可选，需与 `VECTOR_DIM` 一致） | 未设置则用模型默认 |
-| `VECTOR_DIM` | Milvus 向量字段维度 | `4096` |
-| `MILVUS_HOST` / `MILVUS_PORT` / `MILVUS_COLLECTION` | Milvus 连接与集合名 | `localhost` / `19530` / `memory_chunks` |
-| `NEO4J_URI` / `NEO4J_USER` / `NEO4J_PASSWORD` | Neo4j | `bolt://localhost:7687` / `neo4j` / `admin123` |
-| `DEFAULT_USER_ID` | 两个对话接口使用的用户分区 ID | `default` |
-
-若曾用 **768 维** 建过 `memory_chunks`，与当前默认 **4096** 不一致会导致写入失败，需删除该集合或改用新的 `MILVUS_COLLECTION` 名称。
+| `OLLAMA_EMBED_DIMENSIONS` | 嵌入输出维度（须与向量维一致） | 未设置 |
+| `VECTOR_DIM` | Milvus 向量维度 | `4096` |
+| `MILVUS_COLLECTION` | 集合名 | `memory_vectors` |
+| `NEO4J_*` | Neo4j 连接 | 见 `config.py` |
+| `DEFAULT_USER_ID` | 对话接口使用的用户分区 | `default` |
 
 ## HTTP API（仅两个）
 
-请求体均为 JSON，**只有一个字段** `input`（用户原话）。记忆归属用户固定为配置项 **`DEFAULT_USER_ID`**，不由请求体传入。
+请求体 JSON 仅含 **`input`**。`user_id` 固定为 **`DEFAULT_USER_ID`**。
 
-### 存储
+- `POST /memory/conversation/store` — 写入记忆（统一模板）
+- `POST /memory/conversation/query` — 语义检索
 
-`POST /memory/conversation/store`
+详见 [`test_main.http`](test_main.http)。
 
-```json
-{ "input": "记一下：我配偶叫李丽，上周六我们在沃尔玛买了排骨。" }
-```
-
-响应示例字段：`reply`（给用户的话）、`tool_called`、`tool_results`（便于调试）。
-
-### 提取（查询）
-
-`POST /memory/conversation/query`
-
-```json
-{ "input": "我之前说过我配偶叫什么名字？" }
-```
-
-### 测试文件
-
-[`test_main.http`](test_main.http) 中为上述两个接口各提供一条示例请求（适用于 VS Code REST Client / JetBrains HTTP Client）。
-
-## 日志
-
-默认 **INFO** 级别：`main`（请求与生命周期）、`memory_agent`（Ollama 轮次与工具调用）、`memory_service`（连接、Milvus flush、检索分支与结果规模）。异常会打完整堆栈。
-
-## 项目结构（简要）
+## 项目结构
 
 | 文件 | 作用 |
 |------|------|
-| `main.py` | FastAPI 入口，仅注册两个对话路由 |
+| `main.py` | FastAPI 入口 |
 | `config.py` | 配置 |
-| `memory_service.py` | Milvus + Neo4j + 嵌入，`store_memory` / `query_memory` |
-| `memory_agent.py` | Ollama 多轮对话 + 工具执行编排 |
-| `tools_spec.py` | 注入 Ollama 的工具 JSON Schema |
-| `design.md` | 系统设计文档 |
+| `memory_service.py` | v4 Milvus + Neo4j + 嵌入 |
+| `memory_agent.py` | Ollama 编排 + design §6.1/§6.2 提示词 |
+| `tools_spec.py` | 工具 JSON Schema（v4 + v5） |
+| `design.md` | 系统设计 v4 |
 
 ## 许可
 

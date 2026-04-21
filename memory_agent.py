@@ -1,5 +1,6 @@
 """
 通过本地 Ollama 对话：系统提示词 + 工具定义 + 用户一句输入 → 工具执行 → 模型自然语言回复。
+提示词与工具 schema 对齐 design.md v4 与 v5.0 增量（tense / confidence）。
 """
 from __future__ import annotations
 
@@ -17,75 +18,43 @@ from tools_spec import QUERY_MEMORY_TOOL, STORE_MEMORY_TOOL
 
 log = logging.getLogger(__name__)
 
-STORE_SYSTEM_TEMPLATE = """你是长期记忆编码助手。请分析「用户输入」中值得持久化的信息，并调用 `store_memory` 工具写入数据库。若无值得存储的内容，可不调用工具。
+STORE_SYSTEM_TEMPLATE = """你是长期记忆编码助手。请将用户输入中值得保留的信息提取为记忆条目，调用 `store_memory` 工具存储。
 
-### 提取规范
+每条记忆必须遵循以下统一模板（使用中文全角方括号标注字段）：
+【类型】{{事件|事实|知识}}
+【时间】{{YYYY-MM-DD HH:MM，不明确则用当前时间}}
+【地点】{{地点，无则留空}}
+【主体】{{主要关联人，无则留空}}
+【内容】{{核心描述。事件：动作+结果；事实：键=值；知识：标题+要点}}
+【来源】{{原始对话片段或推断依据}}
 
-**1. 事件**
-- 必填字段：`summary`（一句话概括）、`action`（具体行为）。
-- 其他字段尽量补全，若用户未提及则留空，严禁凭空编造：
-  - `time`：发生时间的Unix秒数，无明确时间则用当前时间。
-  - `location`：地点。
-  - `subject`：动作主体（通常为“我”或用户名）。
-  - `participants`：参与人员名单。
-  - `result`：事件结果或造成的影响。
-  - `tense`：时态，可选 `past`（过去）、`present`（现在）、`future`（将来）。
-  - `confidence`：置信度，可选 `real`（真实发生）、`imagined`（想象/虚构）、`planned`（计划中）。
-  - `entities`：事件中涉及的人名、地名、机构名列表。
+提取原则：
+- 不要编造信息，缺失字段可留空。
+- 事件之间的顺序、因果、包含关系请在 `relations` 中声明，通过临时ID引用（如索引0表示第一条记忆，或使用每条 memories 的 `temp_id`）。
+- 事实覆盖关系由系统自动处理，无需显式声明 OVERRIDES。
+- **（v5）时态与置信度**：每条记忆可填 `tense`（`past` / `present` / `future`）与 `confidence`（`real` / `imagined` / `planned`）；事件尤应填写。梦见、虚构、梦境类用 `confidence=imagined` 并选对 `tense`；未来计划用 `confidence=planned` 且常配合 `tense=future`。
 
-**2. 事实**
-- 指稳定的属性或状态，采用标准化键名（推荐英文，如 `spouse_name`、`city`）。
-- 若同一事实多次出现，系统会自动管理版本，你只需提取当前正确的值。
+调用约束：
+- user_id 必须为：{user_id}
+- 当前时间：{current_time}
 
-**3. 知识**
-- 客观方法、规律或外部信息，包含 `title`（标题）和 `content`（内容），可加 `category`（类别）。
-
-**4. 关系**
-- 仅在明确存在以下逻辑时填写：
-  - `NEXT`：事件 A 紧接着事件 B 发生。
-  - `CAUSED`：事件 A 导致了事件 B。
-  - `SUB_EVENT_OF`：子事件指向父事件（注意方向：源头是子事件，目标是父事件）。
-  - `MENTIONS`：事件提及了某个实体。
-- 事实的版本覆盖关系由系统自动处理，无需填写。
-
-### 调用须知
-- 调用工具时，参数 `user_id` 必须且只能填写：{user_id}
-- 当前时间戳（秒）：{current_ts}
-
-### 回复要求
-工具执行成功后，用一两句中文向用户确认已记住的内容，不要展示 JSON 或工具原始返回。
+工具执行成功后，用中文简短确认已记住的内容。
 """
 
 
-QUERY_SYSTEM_TEMPLATE = """你是记忆查询路由专家。根据「用户输入」判断是否需要检索长期记忆。
+QUERY_SYSTEM_TEMPLATE = """你是记忆查询路由专家。根据用户问题构造 `query_memory` 调用参数。
 
-- **需要调用 `query_memory`**：问题涉及用户个人信息、过往经历、个人偏好、已存储的知识。
-- **无需调用工具**：纯寒暄或与记忆无关的问题，直接自然语言回复。
+参数说明：
+- query_text：从用户问题中提炼的语义检索文本。
+- memory_types：根据问题类型限定，如问「做了什么」用 ["event"]，问「我的XX是什么」用 ["fact"]。
+- 若有时间限定（如「上周」），估算并填写 time_start 和 time_end（Unix秒）。
+- **（v5）结构化过滤**：若用户明确限定经历性质（如「过去的经历」「计划中的事」「梦里的事」），可设置 `tense` 或 `confidence` 与 `query_memory` 参数对应，以便精确筛选。
 
-### 查询参数构造指南
+调用约束：
+- user_id 必须为：{user_id}
+- 当前时间：{current_time}
 
-**1. 事实查询（fact_keys）**
-- 根据用户问题，列出可能的标准化键名（英文优先，如 `spouse_name`、`city`、`food_preference`）。
-- **注意**：`fact_keys` 仅用于辅助向量检索，系统会进行语义匹配而非精确字符串比对，因此提供多个候选键名有助于提高召回率。
-- 必须同时提供 `global_vector_fallback.text`，内容为用户原话。
-
-**2. 事件回忆（event_query）**
-- `semantic_text`：描述用户想查找的事件内容（如“买排骨”“去杭州出差”）。
-- 若有时间限定（如“上周”“上个月”），估算并填写 `time_start` 和 `time_end`（Unix 秒）。
-- 若涉及特定人物或地点，将名称填入 `entities` 列表以提高精度。
-
-**3. 知识检索（knowledge_query）**
-- `semantic_text`：描述用户想查找的知识或方法（如“饺子怎么煮不破”）。
-
-**4. 兜底检索（global_vector_fallback）**
-- 务必设置 `global_vector_fallback.text` 为用户原话，当结构化查询无结果时用于全库语义召回。
-
-### 调用约束
-- 调用 `query_memory` 时，参数 `user_id` 必须且只能使用：{user_id}
-- 当前时间参考：{current_human}
-
-### 回复要求
-获得工具结果后，仅用自然语言回答用户，不得输出 JSON 或工具原始返回内容。
+得到结果后，用自然语言回答用户，不要输出 JSON。
 """
 
 
@@ -125,7 +94,6 @@ def _assistant_message_dict(message: Any) -> Dict[str, Any]:
             fn_obj = tc.function
             fn = {"name": fn_obj.name, "arguments": fn_obj.arguments}
             args = fn["arguments"]
-        # Ollama Python 客户端要求 tool_calls[].function.arguments 为 dict，不能是 JSON 字符串
         fn["arguments"] = _normalize_tool_arguments(args)
         fixed.append({"function": fn})
     d["tool_calls"] = fixed
@@ -152,7 +120,6 @@ def _run_tool(
     mem: MemorySystem, name: str, args: Dict[str, Any], trace: str
 ) -> Dict[str, Any]:
     args = dict(args)
-    # 自然语言单参数接口：用户身份仅由服务端 default_user_id 决定
     args["user_id"] = settings.default_user_id
     log.info(
         "%s 执行工具 %s user_id=%s arg_top_keys=%s",
@@ -162,31 +129,54 @@ def _run_tool(
         list(args.keys())[:12],
     )
     if name == "query_memory":
-        log.debug(
-            "%s query_memory 参数详情 fact_keys=%r event_query=%s knowledge_query=%s "
-            "global_vector_fallback=%s",
-            trace,
-            args.get("fact_keys"),
-            args.get("event_query"),
-            args.get("knowledge_query"),
-            args.get("global_vector_fallback"),
-        )
+        log.debug("%s query_memory 参数 keys=%s", trace, list(args.keys()))
     try:
         if name == "store_memory":
             return mem.store_memory(
                 user_id=args["user_id"],
+                memories=args.get("memories"),
+                relations=args.get("relations"),
                 events=args.get("events"),
                 facts=args.get("facts"),
                 knowledge=args.get("knowledge"),
-                relations=args.get("relations"),
             )
         if name == "query_memory":
+            qt = (args.get("query_text") or "").strip()
+            if not qt:
+                parts: List[str] = []
+                gvf = args.get("global_vector_fallback")
+                if isinstance(gvf, dict):
+                    t = (gvf.get("text") or "").strip()
+                    if t:
+                        parts.append(t)
+                fk = args.get("fact_keys")
+                if isinstance(fk, list) and fk:
+                    parts.append(" ".join(str(x) for x in fk if str(x).strip()))
+                eq = args.get("event_query")
+                if isinstance(eq, dict):
+                    st = (eq.get("semantic_text") or "").strip()
+                    if st:
+                        parts.append(st)
+                kq = args.get("knowledge_query")
+                if isinstance(kq, dict):
+                    st = (kq.get("semantic_text") or "").strip()
+                    if st:
+                        parts.append(st)
+                qt = " ".join(parts).strip()
+            if not qt:
+                return {
+                    "error": "缺少 query_text（或可提供 global_vector_fallback / fact_keys 等旧字段以自动拼接）",
+                    "memories": [],
+                }
             return mem.query_memory(
                 user_id=args["user_id"],
-                fact_keys=args.get("fact_keys"),
-                event_query=args.get("event_query"),
-                knowledge_query=args.get("knowledge_query"),
-                global_vector_fallback=args.get("global_vector_fallback"),
+                query_text=qt,
+                memory_types=args.get("memory_types"),
+                time_start=args.get("time_start"),
+                time_end=args.get("time_end"),
+                top_k=int(args.get("top_k", 5)),
+                tense=args.get("tense"),
+                confidence=args.get("confidence"),
             )
         return {"error": f"未知工具: {name}"}
     except Exception as e:
@@ -288,10 +278,8 @@ def _run_loop(
 
 def run_store_assistant(mem: MemorySystem, user_input: str) -> Dict[str, Any]:
     uid = settings.default_user_id
-    system = STORE_SYSTEM_TEMPLATE.format(
-        user_id=uid,
-        current_ts=int(time.time()),
-    )
+    ct = datetime.now().strftime("%Y-%m-%d %H:%M")
+    system = STORE_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
     return _run_loop(
         mem,
         user_input,
@@ -304,10 +292,8 @@ def run_store_assistant(mem: MemorySystem, user_input: str) -> Dict[str, Any]:
 
 def run_query_assistant(mem: MemorySystem, user_input: str) -> Dict[str, Any]:
     uid = settings.default_user_id
-    system = QUERY_SYSTEM_TEMPLATE.format(
-        user_id=uid,
-        current_human=datetime.now().isoformat(timespec="seconds"),
-    )
+    ct = datetime.now().strftime("%Y-%m-%d %H:%M")
+    system = QUERY_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
     return _run_loop(
         mem,
         user_input,

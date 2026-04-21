@@ -1,5 +1,6 @@
 """
-长期记忆存储与查询（Milvus + Neo4j），实现见 design.md。
+长期记忆存储与查询（Milvus + Neo4j），实现见 design.md v4.0 + v5.0 增量（:Memory 上 tense/confidence）。
+旧版 memory_chunks / Event·Fact·Knowledge 与 v4 不兼容，需使用新集合名与新 Neo4j 约束。
 """
 from __future__ import annotations
 
@@ -7,8 +8,9 @@ import logging
 import random
 import threading
 import time
+from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -26,13 +28,33 @@ from pymilvus import (
 from config import settings
 
 
-class RefType(str, Enum):
-    """Milvus / 查询中的 ref_type 与 source_type 常量。"""
-
+class MemoryType(str, Enum):
     event = "event"
     fact = "fact"
     knowledge = "knowledge"
-    structured = "structured"
+
+
+_MEMORY_TYPE_CN = {
+    MemoryType.event.value: "事件",
+    MemoryType.fact.value: "事实",
+    MemoryType.knowledge.value: "知识",
+}
+
+TENSE_ALLOWED = frozenset({"past", "present", "future"})
+CONFIDENCE_ALLOWED = frozenset({"real", "imagined", "planned"})
+
+
+def _normalize_optional_enum(value: Any, allowed: frozenset) -> Optional[str]:
+    """v5：可选枚举；非法或空返回 None。"""
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s not in allowed:
+        log.debug("忽略非法枚举值 %r（允许 %s）", value, sorted(allowed))
+        return None
+    return s
 
 
 class SnowflakeIDGenerator:
@@ -82,68 +104,122 @@ def _milvus_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def _milvus_fact_embed_text(key: str, value: str) -> str:
-    """写入 Milvus 的向量化文本：固定中文句式，键与值完全使用存储时传入的字符串。"""
-    k = (key or "").strip()
-    v = (value or "").strip()
-    return f"事实：键为「{k}」，值为「{v}」。"
+def _milvus_collection_embedding_dim(col: Collection) -> Optional[int]:
+    """已存在集合中 FLOAT_VECTOR 字段的维度；新建集合前无 schema 时不调用。"""
+    try:
+        for field in col.schema.fields:
+            if field.dtype == DataType.FLOAT_VECTOR:
+                params = getattr(field, "params", None) or {}
+                d = params.get("dim")
+                if d is not None:
+                    return int(d)
+                d2 = getattr(field, "dim", None)
+                if d2 is not None:
+                    return int(d2)
+    except Exception as e:
+        log.warning("读取 Milvus 向量维度失败: %s", e)
+    return None
 
 
-def _fact_vector_probe_text(
-    fact_keys: Optional[List[str]],
-    global_vector_fallback: Optional[Dict[str, Any]],
-) -> str:
-    """事实向量检索用查询句：用户原话 + 模型在 fact_keys 里给的键名原文，不做代码侧改写。"""
-    parts: List[str] = []
-    if global_vector_fallback:
-        t = (global_vector_fallback.get("text") or "").strip()
-        if t:
-            parts.append(t)
-    if fact_keys:
-        joined = "、".join(str(x).strip() for x in fact_keys if str(x).strip())
-        if joined:
-            parts.append("相关事实键：" + joined)
-    out = "。".join(parts)
-    return out if out else "个人事实与资料"
+def _assert_milvus_dim_matches_settings(col: Collection) -> None:
+    """已有集合的 embedding 维须与 settings.vector_dim 一致，否则插入阶段才会报难懂的除法错误。"""
+    actual = _milvus_collection_embedding_dim(col)
+    if actual is None:
+        return
+    expected = int(settings.vector_dim)
+    if actual != expected:
+        name = settings.milvus_collection
+        raise RuntimeError(
+            f"Milvus 集合「{name}」中向量字段维度为 {actual}，与当前配置 vector_dim={expected} 不一致"
+            f"（常见于曾用 768 维建库、后改回 Qwen 4096 维嵌入）。"
+            f"请任选其一：1) 在 Milvus 中删除集合 {name} 后重启服务以按 vector_dim={expected} 重建；"
+            f"2) 或在 .env 将 VECTOR_DIM 改为 {actual} 并换用输出 {actual} 维的嵌入模型。"
+        )
 
 
-def _milvus_event_text_cn(
-    summary: str,
-    time_ts: int,
+def _format_time_display(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_time_string_to_ts(time_str: Optional[str]) -> Tuple[str, int]:
+    """返回 (YYYY-MM-DD HH:MM 展示串, Unix 秒)。"""
+    s = (time_str or "").strip()
+    if not s:
+        ts = int(time.time())
+        return _format_time_display(ts), ts
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            ts = int(dt.timestamp())
+            return dt.strftime("%Y-%m-%d %H:%M"), ts
+        except ValueError:
+            continue
+    ts = int(time.time())
+    return _format_time_display(ts), ts
+
+
+def _build_unified_memory_content(
+    memory_type: str,
+    time_display: str,
     location: str,
     subject: str,
-    participants: List[str],
-    action: str,
-    result: str,
-    tense: str,
-    confidence: str,
-    entities: List[str],
+    core_content: str,
+    source: str,
 ) -> str:
-    pts = "、".join(participants or [])
-    ents = "、".join(entities or [])
-    parts = [
-        f"事件摘要：{summary}。",
-        f"发生时间为第{time_ts}秒（时间戳）。",
-        f"地点：{location}。" if location else "",
-        f"主体：{subject}。" if subject else "",
-        f"参与人员：{pts}。" if pts else "",
-        f"经过：{action}。" if action else "",
-        f"结果：{result}。" if result else "",
-        f"时态：{tense or '未填'}。",
-        f"可信程度：{confidence or '未填'}。",
+    """design.md §2.1 统一中文模板。"""
+    type_cn = _MEMORY_TYPE_CN.get(memory_type, memory_type)
+    lines = [
+        f"【类型】{type_cn}",
+        f"【时间】{time_display}",
+        f"【地点】{(location or '').strip()}",
+        f"【主体】{(subject or '').strip()}",
+        f"【内容】{(core_content or '').strip()}",
+        f"【来源】{(source or '').strip()}",
     ]
-    if ents:
-        parts.append(f"涉及人物或事物：{ents}。")
-    return "".join(parts)
+    return "\n".join(lines)
 
 
-def _milvus_knowledge_text_cn(title: str, content: str, category: str) -> str:
-    cat = category or "通用"
-    return f"知识：《{title}》。要点：{content}。类别：{cat}。"
+def _parse_fact_kv_from_core(core: str) -> Optional[Tuple[str, str]]:
+    """从核心内容解析「键 = 值」。"""
+    line = (core or "").strip()
+    if not line or "=" not in line:
+        return None
+    k, _, v = line.partition("=")
+    k, v = k.strip(), v.strip()
+    if not k or not v:
+        return None
+    return k, v
+
+
+def _memory_payload_from_record(
+    rec: Dict[str, Any], memory_id: str
+) -> Dict[str, Any]:
+    """组装返回给工具的 memories 项（含 v5 可选 tense/confidence）。"""
+    item: Dict[str, Any] = {
+        "memory_id": memory_id,
+        "content": rec["content"],
+        "timestamp": rec["timestamp"],
+        "memory_type": rec["memory_type"],
+    }
+    if rec.get("tense") is not None:
+        item["tense"] = rec["tense"]
+    if rec.get("confidence") is not None:
+        item["confidence"] = rec["confidence"]
+    return item
+
+
+def _content_line_summary(content: str, max_len: int = 120) -> str:
+    """从统一文本中取【内容】一行作因果链摘要。"""
+    for raw in (content or "").splitlines():
+        line = raw.strip()
+        if line.startswith("【内容】"):
+            inner = line.replace("【内容】", "", 1).strip()
+            return inner[:max_len] if inner else line[:max_len]
+    return (content or "").replace("\n", " ")[:max_len]
 
 
 class MemorySystem:
-    """连接 Milvus / Neo4j，提供 store_memory 与 query_memory。"""
+    """连接 Milvus / Neo4j，提供 v4/v5 store_memory 与 query_memory。"""
 
     def __init__(self) -> None:
         self._id_gen = SnowflakeIDGenerator(
@@ -167,6 +243,7 @@ class MemorySystem:
             port=settings.milvus_port,
         )
         self._collection = self._init_milvus_collection()
+        _assert_milvus_dim_matches_settings(self._collection)
         log.info("MemorySystem.connect: Milvus 集合已加载")
         self._driver = GraphDatabase.driver(
             settings.neo4j_uri,
@@ -189,7 +266,6 @@ class MemorySystem:
         log.info("MemorySystem.close: 完成")
 
     def _get_embedding(self, text: str) -> List[float]:
-        """单条文本嵌入；带超时与有限次重试。"""
         last_err: Optional[BaseException] = None
         for attempt in range(max(1, settings.ollama_embed_retries)):
             try:
@@ -221,7 +297,6 @@ class MemorySystem:
         ) from last_err
 
     def _get_embeddings_batch(self, texts: Sequence[str]) -> List[List[float]]:
-        """多条文本一次请求嵌入；失败则逐条回退。"""
         if not texts:
             return []
         try:
@@ -251,7 +326,7 @@ class MemorySystem:
 
         fields = [
             FieldSchema(
-                name="chunk_id",
+                name="memory_id",
                 dtype=DataType.VARCHAR,
                 max_length=64,
                 is_primary=True,
@@ -260,11 +335,9 @@ class MemorySystem:
             FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim),
             FieldSchema(name="timestamp", dtype=DataType.INT64),
-            FieldSchema(name="source_type", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="ref_type", dtype=DataType.VARCHAR, max_length=32),
-            FieldSchema(name="ref_id", dtype=DataType.VARCHAR, max_length=64),
+            FieldSchema(name="memory_type", dtype=DataType.VARCHAR, max_length=32),
         ]
-        schema = CollectionSchema(fields, description="Long-term memory chunks")
+        schema = CollectionSchema(fields, description="v4 unified memory vectors")
         col = Collection(name, schema)
         col.create_index(
             "embedding",
@@ -274,7 +347,7 @@ class MemorySystem:
                 "params": {"M": 16, "efConstruction": 200},
             },
         )
-        for scalar in ("user_id", "timestamp", "ref_type"):
+        for scalar in ("user_id", "timestamp", "memory_type"):
             try:
                 col.create_index(scalar, {"index_type": "AUTOINDEX"})
             except Exception:
@@ -289,163 +362,41 @@ class MemorySystem:
                 "CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.user_id IS UNIQUE"
             )
             session.run(
-                "CREATE CONSTRAINT event_id_unique IF NOT EXISTS FOR (e:Event) REQUIRE e.event_id IS UNIQUE"
-            )
-            session.run(
-                "CREATE CONSTRAINT fact_id_unique IF NOT EXISTS FOR (f:Fact) REQUIRE f.fact_id IS UNIQUE"
-            )
-            session.run(
-                "CREATE CONSTRAINT knowledge_id_unique IF NOT EXISTS FOR (k:Knowledge) REQUIRE k.knowledge_id IS UNIQUE"
-            )
-            session.run(
-                "CREATE CONSTRAINT entity_name_type IF NOT EXISTS FOR (e:Entity) REQUIRE (e.name, e.type) IS UNIQUE"
+                "CREATE CONSTRAINT memory_id_unique IF NOT EXISTS FOR (m:Memory) REQUIRE m.memory_id IS UNIQUE"
             )
 
-    def _insert_milvus_rows(
+    def _insert_milvus_v4(
         self,
-        chunk_ids: List[str],
+        memory_ids: List[str],
         user_ids: List[str],
         texts: List[str],
         embeddings: List[List[float]],
         timestamps: List[int],
-        source_types: List[str],
-        ref_types: List[str],
-        ref_ids: List[str],
+        memory_types: List[str],
     ) -> None:
         assert self._collection is not None
-        n = len(chunk_ids)
+        n = len(memory_ids)
         if n == 0:
             return
         if not (
-            n == len(user_ids) == len(texts) == len(embeddings) == len(timestamps)
-            == len(source_types) == len(ref_types) == len(ref_ids)
+            n == len(user_ids) == len(texts) == len(embeddings) == len(timestamps) == len(memory_types)
         ):
-            raise ValueError("Milvus 插入各列长度不一致")
+            raise ValueError("Milvus v4 插入各列长度不一致")
+        exp_dim = int(settings.vector_dim)
+        for i, vec in enumerate(embeddings):
+            if len(vec) != exp_dim:
+                raise ValueError(
+                    f"第 {i} 条嵌入维度为 {len(vec)}，与 vector_dim={exp_dim} 不一致；"
+                    "请检查 OLLAMA_EMBED_MODEL / OLLAMA_EMBED_DIMENSIONS 与 Milvus 集合是否一致。"
+                )
         try:
             self._collection.insert(
-                [
-                    chunk_ids,
-                    user_ids,
-                    texts,
-                    embeddings,
-                    timestamps,
-                    source_types,
-                    ref_types,
-                    ref_ids,
-                ]
+                [memory_ids, user_ids, texts, embeddings, timestamps, memory_types]
             )
         except Exception as e:
             raise RuntimeError(
-                f"Milvus insert 失败 rows={n} ref_types_sample={ref_types[:3]!r}"
+                f"Milvus insert 失败 rows={n} memory_types_sample={memory_types[:3]!r}"
             ) from e
-
-    def _create_user(self, session, user_id: str) -> None:
-        session.run("MERGE (:User {user_id: $user_id})", user_id=user_id)
-
-    def _resolve_node(
-        self,
-        session,
-        user_id: str,
-        summary: str,
-        node_kind: str,
-        *,
-        temp_id_map: Optional[Dict[str, str]] = None,
-        batch_event_nodes: Optional[List[Any]] = None,
-        batch_fact_nodes: Optional[List[Any]] = None,
-        batch_knowledge_nodes: Optional[List[Any]] = None,
-    ) -> Optional[Any]:
-        summary = (summary or "").strip()
-        if not summary:
-            return None
-        if temp_id_map and summary in temp_id_map:
-            eid = temp_id_map[summary]
-            rec = session.run(
-                "MATCH (n) WHERE elementId(n) = $eid RETURN n AS n",
-                eid=eid,
-            ).single()
-            return rec["n"] if rec else None
-
-        if node_kind == "event":
-            if batch_event_nodes:
-                for enode in batch_event_nodes:
-                    s = (enode.get("summary") or "").strip()
-                    a = (enode.get("action") or "").strip()
-                    if summary == s or summary == a:
-                        return enode
-            rec = session.run(
-                """
-                MATCH (u:User {user_id: $user_id})-[:HAS_EVENT]->(e:Event)
-                WHERE e.summary = $s OR e.action = $s
-                RETURN e ORDER BY e.time DESC LIMIT 1
-                """,
-                user_id=user_id,
-                s=summary,
-            ).single()
-            if rec:
-                return rec["e"]
-            rec = session.run(
-                """
-                MATCH (u:User {user_id: $user_id})-[:HAS_EVENT]->(e:Event)
-                WHERE e.summary CONTAINS $s OR e.action CONTAINS $s
-                RETURN e ORDER BY e.time DESC LIMIT 1
-                """,
-                user_id=user_id,
-                s=summary,
-            ).single()
-            return rec["e"] if rec else None
-
-        if node_kind == "fact":
-            if batch_fact_nodes:
-                for fnode in batch_fact_nodes:
-                    k = (fnode.get("key") or "").strip()
-                    if k == summary:
-                        return fnode
-            rec = session.run(
-                """
-                MATCH (u:User {user_id: $user_id})-[:HAS_FACT]->(f:Fact {key: $k})
-                RETURN f ORDER BY f.updated_at DESC LIMIT 1
-                """,
-                user_id=user_id,
-                k=summary,
-            ).single()
-            return rec["f"] if rec else None
-
-        if node_kind == "knowledge":
-            if summary.startswith("kn_"):
-                rec = session.run(
-                    """
-                    MATCH (k:Knowledge {knowledge_id: $kid})
-                    RETURN k LIMIT 1
-                    """,
-                    kid=summary,
-                ).single()
-                if rec:
-                    return rec["k"]
-            if batch_knowledge_nodes:
-                for knode in batch_knowledge_nodes:
-                    t = (knode.get("title") or "").strip()
-                    if t == summary:
-                        return knode
-            rec = session.run(
-                """
-                MATCH (k:Knowledge {title: $t})
-                RETURN k LIMIT 1
-                """,
-                t=summary,
-            ).single()
-            return rec["k"] if rec else None
-
-        if node_kind == "entity":
-            rec = session.run(
-                """
-                MATCH (ent:Entity)
-                WHERE ent.name = $n
-                RETURN ent LIMIT 1
-                """,
-                n=summary,
-            ).single()
-            return rec["ent"] if rec else None
-        return None
 
     @staticmethod
     def _node_element_id(node: Any) -> str:
@@ -454,28 +405,9 @@ class MemorySystem:
             return str(eid)
         return str(node.id)
 
-    def _merge_rel(
-        self,
-        session,
-        source_element_id: str,
-        target_element_id: str,
-        rtype: str,
-        overrides_ts: Optional[int] = None,
+    def _merge_memory_rel(
+        self, session, source_element_id: str, target_element_id: str, rtype: str
     ) -> None:
-        if rtype == "OVERRIDES":
-            ts = overrides_ts if overrides_ts is not None else int(time.time())
-            session.run(
-                """
-                MATCH (s) WHERE elementId(s) = $sid
-                MATCH (t) WHERE elementId(t) = $tid
-                MERGE (s)-[r:OVERRIDES]->(t)
-                SET r.timestamp = $ts
-                """,
-                sid=source_element_id,
-                tid=target_element_id,
-                ts=ts,
-            )
-            return
         queries = {
             "NEXT": """
                 MATCH (s) WHERE elementId(s) = $sid
@@ -492,15 +424,10 @@ class MemorySystem:
                 MATCH (t) WHERE elementId(t) = $tid
                 MERGE (s)-[:SUB_EVENT_OF]->(t)
             """,
-            "RELATED_TO": """
+            "RELATED": """
                 MATCH (s) WHERE elementId(s) = $sid
                 MATCH (t) WHERE elementId(t) = $tid
-                MERGE (s)-[:RELATED_TO]->(t)
-            """,
-            "MENTIONS": """
-                MATCH (s) WHERE elementId(s) = $sid
-                MATCH (t) WHERE elementId(t) = $tid
-                MERGE (s)-[:MENTIONS]->(t)
+                MERGE (s)-[:RELATED]->(t)
             """,
         }
         q = queries.get(rtype)
@@ -510,693 +437,383 @@ class MemorySystem:
     def store_memory(
         self,
         user_id: str,
-        events: Optional[List[Dict[str, Any]]] = None,
-        facts: Optional[List[Dict[str, Any]]] = None,
-        knowledge: Optional[List[Dict[str, Any]]] = None,
+        memories: Optional[List[Dict[str, Any]]] = None,
         relations: Optional[List[Dict[str, Any]]] = None,
+        # 以下参数已废弃，保留签名兼容以免旧调用崩溃（勿用于新代码）
+        events: Any = None,
+        facts: Any = None,
+        knowledge: Any = None,
     ) -> Dict[str, Any]:
         assert self._driver is not None and self._collection is not None
+        if events is not None or facts is not None or knowledge is not None:
+            log.warning(
+                "store_memory 收到已废弃的 events/facts/knowledge 参数，v4 请仅使用 memories"
+            )
+        memories = memories or []
+        relations = relations or []
         log.info(
-            "store_memory 开始 user_id=%s events=%s facts=%s knowledge=%s relations=%s",
+            "store_memory v5 user_id=%s memories=%s relations=%s",
             user_id,
-            len(events or []),
-            len(facts or []),
-            len(knowledge or []),
-            len(relations or []),
+            len(memories),
+            len(relations),
         )
-        stored_ids: Dict[str, List[str]] = {
-            "event_ids": [],
-            "fact_ids": [],
-            "knowledge_ids": [],
-        }
-        milvus_chunk_ids: List[str] = []
-        milvus_user_ids: List[str] = []
+
+        memory_ids_out: List[str] = []
+        milvus_mids: List[str] = []
+        milvus_uids: List[str] = []
         milvus_texts: List[str] = []
-        milvus_timestamps: List[int] = []
-        milvus_source_types: List[str] = []
-        milvus_ref_types: List[str] = []
-        milvus_ref_ids: List[str] = []
-        temp_id_map: Dict[str, str] = {}
-        batch_event_nodes: List[Any] = []
-        batch_fact_nodes: List[Any] = []
-        batch_knowledge_nodes: List[Any] = []
+        milvus_ts: List[int] = []
+        milvus_types: List[str] = []
+
+        temp_id_to_element_id: Dict[str, str] = {}
 
         with self._driver.session() as session:
             self._create_user(session, user_id)
 
-            if events:
-                for ev in events:
-                    event_id = f"ev_{self._id_gen.next_str()}"
-                    summary = ev.get("summary", "")
-                    time_ts = int(ev.get("time", ev.get("timestamp", int(time.time()))))
-                    location = ev.get("location", "") or ""
-                    subject = ev.get("subject", "") or ""
-                    participants = list(ev.get("participants", []) or [])
-                    action = ev.get("action", "") or summary
-                    result = ev.get("result", "") or ""
-                    tense = ev.get("tense", "past")
-                    confidence = ev.get("confidence", "real")
+            for idx, item in enumerate(memories):
+                mtype = (item.get("type") or "").strip().lower()
+                if mtype not in (MemoryType.event.value, MemoryType.fact.value, MemoryType.knowledge.value):
+                    log.warning("跳过无效 memory type=%r", item.get("type"))
+                    continue
+                core = (item.get("content") or "").strip()
+                if not core:
+                    log.warning("跳过无 content 的记忆项 index=%s", idx)
+                    continue
 
-                    row_e = session.run(
-                        """
-                        MATCH (u:User {user_id: $user_id})
-                        CREATE (e:Event {
-                            event_id: $event_id, summary: $summary, time: $time,
-                            location: $location, subject: $subject, participants: $participants,
-                            action: $action, result: $result, tense: $tense, confidence: $confidence
-                        })
-                        CREATE (u)-[:HAS_EVENT]->(e)
-                        RETURN e
-                        """,
-                        user_id=user_id,
-                        event_id=event_id,
-                        summary=summary,
-                        time=time_ts,
-                        location=location,
-                        subject=subject,
-                        participants=participants,
-                        action=action,
-                        result=result,
-                        tense=tense,
-                        confidence=confidence,
-                    ).single()
-                    enode = row_e["e"] if row_e else None
-                    if enode is not None:
-                        batch_event_nodes.append(enode)
-                    tid = ev.get("temp_id") or ev.get("client_ref")
-                    if tid and str(tid).strip() and enode is not None:
-                        temp_id_map[str(tid).strip()] = self._node_element_id(enode)
-                    stored_ids["event_ids"].append(event_id)
+                time_disp, ts = _parse_time_string_to_ts(item.get("time"))
+                loc = (item.get("location") or "").strip()
+                subj = (item.get("subject") or "").strip()
+                src = (item.get("source") or "").strip()
+                tense_v = _normalize_optional_enum(item.get("tense"), TENSE_ALLOWED)
+                conf_v = _normalize_optional_enum(
+                    item.get("confidence"), CONFIDENCE_ALLOWED
+                )
 
-                    for ent in ev.get("entities", []) or []:
-                        if not str(ent).strip():
-                            continue
-                        session.run(
-                            """
-                            MATCH (e:Event {event_id: $event_id})
-                            MERGE (ent:Entity {name: $name, type: 'other'})
-                            MERGE (e)-[:MENTIONS]->(ent)
-                            """,
-                            event_id=event_id,
-                            name=str(ent).strip(),
-                        )
+                full_content = _build_unified_memory_content(
+                    mtype, time_disp, loc, subj, core, src
+                )
+                memory_id = f"mem_{self._id_gen.next_str()}"
+                memory_ids_out.append(memory_id)
 
-                    embed_text = _milvus_event_text_cn(
-                        summary=summary,
-                        time_ts=time_ts,
-                        location=location,
-                        subject=subject,
-                        participants=participants,
-                        action=action,
-                        result=result,
-                        tense=tense,
-                        confidence=confidence,
-                        entities=list(ev.get("entities") or []),
-                    )
-                    milvus_chunk_ids.append(f"chk_{self._id_gen.next_str()}")
-                    milvus_user_ids.append(user_id)
-                    milvus_texts.append(embed_text[:4096])
-                    milvus_timestamps.append(time_ts)
-                    milvus_source_types.append(RefType.structured.value)
-                    milvus_ref_types.append(RefType.event.value)
-                    milvus_ref_ids.append(event_id)
+                fk: Optional[str] = None
+                fv: Optional[str] = None
+                if mtype == MemoryType.fact.value:
+                    parsed = _parse_fact_kv_from_core(core)
+                    if parsed:
+                        fk, fv = parsed
 
-            if facts:
-                for fact in facts:
-                    key, value = fact["key"], fact["value"]
-                    confidence = fact.get("confidence", "high")
-                    fact_id = f"fact_{self._id_gen.next_str()}"
-                    now_ts = int(time.time())
-
+                superseded_id: Optional[str] = None
+                if mtype == MemoryType.fact.value and fk is not None and fv is not None:
                     old = session.run(
                         """
-                        MATCH (u:User {user_id: $user_id})-[:HAS_FACT]->(f:Fact {key: $key})
-                        RETURN f ORDER BY f.updated_at DESC LIMIT 1
+                        MATCH (u:User {user_id: $user_id})-[:HAS_MEMORY]->(m:Memory)
+                        WHERE m.memory_type = 'fact' AND m.fact_key = $fk
+                          AND NOT (m)<-[:OVERRIDES]-(:Memory)
+                        RETURN m ORDER BY m.timestamp DESC LIMIT 1
                         """,
                         user_id=user_id,
-                        key=key,
+                        fk=fk,
                     ).single()
+                    if (
+                        old
+                        and old["m"].get("fact_value") is not None
+                        and str(old["m"].get("fact_value")) != fv
+                    ):
+                        superseded_id = old["m"]["memory_id"]
 
-                    row_f = session.run(
+                row = session.run(
+                    """
+                    MATCH (u:User {user_id: $user_id})
+                    CREATE (m:Memory {
+                        memory_id: $memory_id,
+                        content: $content,
+                        timestamp: $ts,
+                        memory_type: $mtype,
+                        fact_key: $fk,
+                        fact_value: $fv,
+                        tense: $tense,
+                        confidence: $confidence
+                    })
+                    CREATE (u)-[:HAS_MEMORY]->(m)
+                    RETURN m
+                    """,
+                    user_id=user_id,
+                    memory_id=memory_id,
+                    content=full_content,
+                    ts=ts,
+                    mtype=mtype,
+                    fk=fk,
+                    fv=fv,
+                    tense=tense_v,
+                    confidence=conf_v,
+                ).single()
+                mnode = row["m"] if row else None
+
+                tid = (item.get("temp_id") or item.get("client_ref") or str(idx)).strip()
+                if mnode is not None:
+                    temp_id_to_element_id[tid] = self._node_element_id(mnode)
+
+                if superseded_id:
+                    session.run(
                         """
-                        MATCH (u:User {user_id: $user_id})
-                        CREATE (f:Fact {
-                            fact_id: $fact_id, key: $key, value: $value,
-                            updated_at: $ts, confidence: $confidence
-                        })
-                        CREATE (u)-[:HAS_FACT]->(f)
-                        RETURN f
+                        MATCH (new:Memory {memory_id: $new_id})
+                        MATCH (old:Memory {memory_id: $old_id})
+                        MERGE (new)-[:OVERRIDES {timestamp: $ots}]->(old)
                         """,
-                        user_id=user_id,
-                        fact_id=fact_id,
-                        key=key,
-                        value=value,
-                        ts=now_ts,
-                        confidence=confidence,
-                    ).single()
-                    fnode = row_f["f"] if row_f else None
-                    if fnode is not None:
-                        batch_fact_nodes.append(fnode)
-                    ftid = fact.get("temp_id") or fact.get("client_ref")
-                    if ftid and str(ftid).strip() and fnode is not None:
-                        temp_id_map[str(ftid).strip()] = self._node_element_id(fnode)
-                    stored_ids["fact_ids"].append(fact_id)
+                        new_id=memory_id,
+                        old_id=superseded_id,
+                        ots=int(time.time()),
+                    )
 
-                    if old and old["f"].get("value") != value:
-                        session.run(
-                            """
-                            MATCH (new:Fact {fact_id: $new_id})
-                            MATCH (old:Fact {fact_id: $old_id})
-                            MERGE (new)-[:OVERRIDES {timestamp: $ts}]->(old)
-                            """,
-                            new_id=fact_id,
-                            old_id=old["f"]["fact_id"],
-                            ts=now_ts,
+                milvus_mids.append(memory_id)
+                milvus_uids.append(user_id)
+                milvus_texts.append(full_content[:4096])
+                milvus_ts.append(ts)
+                milvus_types.append(mtype)
+
+            allowed_rel = {"NEXT", "CAUSED", "SUB_EVENT_OF", "RELATED"}
+            for rel in relations:
+                rtype = (rel.get("type") or "").strip()
+                if rtype not in allowed_rel:
+                    continue
+                sid_key = (rel.get("source_temp_id") or "").strip()
+                tid_key = (rel.get("target_temp_id") or "").strip()
+                se = temp_id_to_element_id.get(sid_key)
+                te = temp_id_to_element_id.get(tid_key)
+                if not se or not te:
+                    log.warning(
+                        "relations 跳过：无法解析 temp_id source=%r target=%r",
+                        sid_key,
+                        tid_key,
+                    )
+                    continue
+                self._merge_memory_rel(session, se, te, rtype)
+                if rtype == "SUB_EVENT_OF":
+                    chk = session.run(
+                        """
+                        MATCH (s) WHERE elementId(s) = $sid
+                        MATCH (t) WHERE elementId(t) = $tid
+                        RETURN coalesce(s.timestamp, 0) AS st, coalesce(t.timestamp, 0) AS tt
+                        """,
+                        sid=se,
+                        tid=te,
+                    ).single()
+                    if chk and int(chk.get("st") or 0) > int(chk.get("tt") or 0):
+                        log.warning(
+                            "SUB_EVENT_OF: 子记忆时间戳晚于父记忆，请确认方向为子→父"
                         )
 
-                    embed_text = _milvus_fact_embed_text(str(key), str(value))
-                    milvus_chunk_ids.append(f"chk_{self._id_gen.next_str()}")
-                    milvus_user_ids.append(user_id)
-                    milvus_texts.append(embed_text[:4096])
-                    milvus_timestamps.append(now_ts)
-                    milvus_source_types.append(RefType.structured.value)
-                    milvus_ref_types.append(RefType.fact.value)
-                    milvus_ref_ids.append(fact_id)
-
-            if knowledge:
-                for kn in knowledge:
-                    kn_id = f"kn_{self._id_gen.next_str()}"
-                    title = kn["title"]
-                    content = kn["content"]
-                    category = kn.get("category", "general") or "general"
-                    row_k = session.run(
-                        """
-                        CREATE (k:Knowledge {
-                            knowledge_id: $kn_id, title: $title, content: $content, category: $category
-                        })
-                        RETURN k
-                        """,
-                        kn_id=kn_id,
-                        title=title,
-                        content=content,
-                        category=category,
-                    ).single()
-                    knode = row_k["k"] if row_k else None
-                    if knode is not None:
-                        batch_knowledge_nodes.append(knode)
-                    ktid = kn.get("temp_id") or kn.get("client_ref")
-                    if ktid and str(ktid).strip() and knode is not None:
-                        temp_id_map[str(ktid).strip()] = self._node_element_id(knode)
-                    stored_ids["knowledge_ids"].append(kn_id)
-
-                    embed_text = _milvus_knowledge_text_cn(
-                        str(title), str(content), str(category)
-                    )
-                    ts = int(time.time())
-                    milvus_chunk_ids.append(f"chk_{self._id_gen.next_str()}")
-                    milvus_user_ids.append(user_id)
-                    milvus_texts.append(embed_text[:4096])
-                    milvus_timestamps.append(ts)
-                    milvus_source_types.append(RefType.structured.value)
-                    milvus_ref_types.append(RefType.knowledge.value)
-                    milvus_ref_ids.append(kn_id)
-
-            if relations:
-                allowed = {
-                    "NEXT",
-                    "CAUSED",
-                    "SUB_EVENT_OF",
-                    "MENTIONS",
-                    "OVERRIDES",
-                    "RELATED_TO",
-                }
-                for rel in relations:
-                    rtype = rel.get("type")
-                    if rtype not in allowed:
-                        continue
-                    st = rel.get("source_type")
-                    tt = rel.get("target_type")
-                    src = self._resolve_node(
-                        session,
-                        user_id,
-                        rel.get("source_summary", ""),
-                        st or "event",
-                        temp_id_map=temp_id_map,
-                        batch_event_nodes=batch_event_nodes,
-                        batch_fact_nodes=batch_fact_nodes,
-                        batch_knowledge_nodes=batch_knowledge_nodes,
-                    )
-                    tgt = self._resolve_node(
-                        session,
-                        user_id,
-                        rel.get("target_summary", ""),
-                        tt or "event",
-                        temp_id_map=temp_id_map,
-                        batch_event_nodes=batch_event_nodes,
-                        batch_fact_nodes=batch_fact_nodes,
-                        batch_knowledge_nodes=batch_knowledge_nodes,
-                    )
-                    if src is None or tgt is None:
-                        continue
-                    sid = self._node_element_id(src)
-                    tid = self._node_element_id(tgt)
-                    self._merge_rel(
-                        session,
-                        sid,
-                        tid,
-                        rtype,
-                        overrides_ts=int(time.time()) if rtype == "OVERRIDES" else None,
-                    )
-                    if rtype == "SUB_EVENT_OF":
-                        chk = session.run(
-                            """
-                            MATCH (s) WHERE elementId(s) = $sid
-                            MATCH (t) WHERE elementId(t) = $tid
-                            RETURN coalesce(s.time, 0) AS st, coalesce(t.time, 0) AS tt
-                            """,
-                            sid=sid,
-                            tid=tid,
-                        ).single()
-                        if chk and chk.get("st") is not None and chk.get("tt") is not None:
-                            if int(chk["st"]) > int(chk["tt"]):
-                                log.warning(
-                                    "SUB_EVENT_OF: 子事件时间晚于父事件 (子 time=%s 父 time=%s)，请确认方向为子→父",
-                                    chk["st"],
-                                    chk["tt"],
-                                )
-
-        if milvus_texts:
-            embeddings = self._get_embeddings_batch(milvus_texts)
-            self._insert_milvus_rows(
-                milvus_chunk_ids,
-                milvus_user_ids,
-                milvus_texts,
-                embeddings,
-                milvus_timestamps,
-                milvus_source_types,
-                milvus_ref_types,
-                milvus_ref_ids,
+        if milvus_mids:
+            vecs = self._get_embeddings_batch(milvus_texts)
+            self._insert_milvus_v4(
+                milvus_mids, milvus_uids, milvus_texts, vecs, milvus_ts, milvus_types
             )
 
-        log.info("store_memory: Milvus flush")
         self._collection.flush()
-        msg = (
-            f"已存储 {len(stored_ids['event_ids'])} 个事件, "
-            f"{len(stored_ids['fact_ids'])} 个事实, "
-            f"{len(stored_ids['knowledge_ids'])} 条知识"
-        )
-        log.info("store_memory 完成 %s", msg)
-        return {"success": True, "stored_ids": stored_ids, "message": msg}
+        msg = f"已存储 {len(memory_ids_out)} 条记忆"
+        log.info("store_memory v5 完成 %s", msg)
+        return {"success": True, "memory_ids": memory_ids_out, "message": msg}
 
-    def _causal_chain_for_event(self, session, event_id: str) -> List[str]:
-        """自根因事件到当前事件的一条最长 CAUSED 链（单条 Cypher）。"""
+    def _create_user(self, session, user_id: str) -> None:
+        session.run("MERGE (:User {user_id: $user_id})", user_id=user_id)
+
+    def _current_fact_memory(
+        self,
+        session: Any,
+        user_id: str,
+        fact_key: str,
+        filter_tense: Optional[str] = None,
+        filter_confidence: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         rec = session.run(
             """
-            MATCH (e:Event {event_id: $eid})
-            OPTIONAL MATCH p = (e)<-[:CAUSED*1..15]-(r:Event)
-            WHERE NOT (r)<-[:CAUSED]-(:Event)
+            MATCH (u:User {user_id: $user_id})-[:HAS_MEMORY]->(m:Memory)
+            WHERE m.memory_type = 'fact' AND m.fact_key = $fk
+              AND NOT (m)<-[:OVERRIDES]-(:Memory)
+              AND ($ft IS NULL OR m.tense = $ft)
+              AND ($fc IS NULL OR m.confidence = $fc)
+            RETURN m.memory_id AS memory_id, m.content AS content,
+                   m.timestamp AS timestamp, m.memory_type AS memory_type,
+                   m.tense AS tense, m.confidence AS confidence
+            ORDER BY m.timestamp DESC
+            LIMIT 1
+            """,
+            user_id=user_id,
+            fk=fact_key,
+            ft=filter_tense,
+            fc=filter_confidence,
+        ).single()
+        return dict(rec) if rec else None
+
+    def _parse_fact_key_from_stored_content(self, content: str) -> Optional[str]:
+        """从已落库的完整模板中解析事实键（与 fact_key 属性互为补充）。"""
+        for raw in (content or "").splitlines():
+            line = raw.strip()
+            if line.startswith("【内容】"):
+                inner = line.replace("【内容】", "", 1).strip()
+                if "=" in inner:
+                    return inner.split("=", 1)[0].strip()
+        return None
+
+    def _causal_chain_for_memory_event(
+        self, session: Any, memory_id: str
+    ) -> List[str]:
+        rec = session.run(
+            """
+            MATCH (e:Memory {memory_id: $mid})
+            WHERE e.memory_type = 'event'
+            OPTIONAL MATCH p = (e)<-[:CAUSED*1..15]-(r:Memory)
+            WHERE r.memory_type = 'event' AND NOT (r)<-[:CAUSED]-(:Memory)
             WITH e, p
             ORDER BY length(p) DESC
             LIMIT 1
-            RETURN e.summary AS leaf_s,
+            RETURN e.content AS leaf_c,
                    CASE WHEN p IS NULL THEN []
-                        ELSE [n IN reverse(nodes(p)) WHERE elementId(n) <> elementId(e) | n.summary]
+                        ELSE [n IN reverse(nodes(p)) WHERE elementId(n) <> elementId(e) | n.content]
                    END AS chain
             """,
-            eid=event_id,
+            mid=memory_id,
         ).single()
         if not rec:
             return []
         out: List[str] = []
-        for s in rec.get("chain") or []:
-            if s and str(s).strip():
-                out.append(str(s).strip())
-        leaf = rec.get("leaf_s")
+        for c in rec.get("chain") or []:
+            if c and str(c).strip():
+                out.append(_content_line_summary(str(c)))
+        leaf = rec.get("leaf_c")
         if leaf and str(leaf).strip():
-            out.append(str(leaf).strip())
+            out.append(_content_line_summary(str(leaf)))
         return out
-
-    def _parent_summaries(self, session, event_id: str) -> List[str]:
-        rows = session.run(
-            """
-            MATCH (e:Event {event_id: $eid})-[:SUB_EVENT_OF]->(p:Event)
-            RETURN p.summary AS s
-            """,
-            eid=event_id,
-        )
-        return [r["s"] for r in rows if r.get("s")]
-
-    def _fact_current_value(
-        self, session: Any, user_id: str, key: str
-    ) -> Optional[str]:
-        """用户维度下某 key 的当前头事实（无 OVERRIDES 入边），按 updated_at 最新。"""
-        rec = session.run(
-            """
-            MATCH (u:User {user_id: $user_id})-[:HAS_FACT]->(f:Fact {key: $key})
-            WHERE NOT (f)<-[:OVERRIDES]-(:Fact)
-            RETURN f.value AS value
-            ORDER BY f.updated_at DESC
-            LIMIT 1
-            """,
-            user_id=user_id,
-            key=key,
-        ).single()
-        if not rec or rec.get("value") is None:
-            return None
-        return str(rec["value"])
-
-    def _hydrate_facts_from_ref_ids(
-        self,
-        session: Any,
-        result: Dict[str, Any],
-        user_id: str,
-        fact_ids: Sequence[str],
-    ) -> None:
-        """向量命中的多条 fact_id：先取 key，再按 key 回填用户下当前有效值。"""
-        ordered: List[str] = []
-        seen_f: set[str] = set()
-        for fid in fact_ids:
-            fs = str(fid).strip()
-            if not fs or fs in seen_f:
-                continue
-            seen_f.add(fs)
-            ordered.append(fs)
-        if not ordered:
-            return
-        rows = session.run(
-            """
-            UNWIND $ids AS fid
-            MATCH (f:Fact {fact_id: fid})
-            RETURN f.fact_id AS fact_id, f.key AS key
-            """,
-            ids=ordered,
-        )
-        by_fid: Dict[str, str] = {}
-        for r in rows:
-            fid = r.get("fact_id")
-            k = r.get("key")
-            if fid is not None and k is not None:
-                by_fid[str(fid)] = str(k)
-        key_order: List[str] = []
-        seen_keys: set[str] = set()
-        for fid in ordered:
-            k = by_fid.get(fid)
-            if k is None:
-                continue
-            if k not in seen_keys:
-                seen_keys.add(k)
-                key_order.append(k)
-        for key in key_order:
-            val = self._fact_current_value(session, user_id, key)
-            if val is not None:
-                result["facts"][key] = val
 
     def query_memory(
         self,
         user_id: str,
-        fact_keys: Optional[List[str]] = None,
-        event_query: Optional[Dict[str, Any]] = None,
-        knowledge_query: Optional[Dict[str, Any]] = None,
-        global_vector_fallback: Optional[Dict[str, Any]] = None,
+        query_text: str,
+        memory_types: Optional[List[str]] = None,
+        time_start: Optional[int] = None,
+        time_end: Optional[int] = None,
+        top_k: int = 5,
+        tense: Optional[str] = None,
+        confidence: Optional[str] = None,
     ) -> Dict[str, Any]:
         assert self._driver is not None and self._collection is not None
-        log.info(
-            "query_memory 开始 user_id=%s fact_keys=%s has_event_query=%s has_knowledge_query=%s has_fallback=%s",
-            user_id,
-            fact_keys,
-            bool(event_query),
-            bool(knowledge_query),
-            bool(global_vector_fallback),
-        )
+        qt = (query_text or "").strip()
+        if not qt:
+            return {
+                "memories": [],
+                "causal_chain": [],
+                "error": "query_text 不能为空",
+            }
+
+        ft = _normalize_optional_enum(tense, TENSE_ALLOWED)
+        fc = _normalize_optional_enum(confidence, CONFIDENCE_ALLOWED)
+
         col = self._collection
         uid_expr = _milvus_escape(user_id)
         search_ef = settings.milvus_search_ef
-        result: Dict[str, Any] = {
-            "facts": {},
-            "events": [],
-            "knowledge": [],
-            "vector_chunks": [],
-            "causal_chains": [],
-            "parent_events": [],
-        }
+        mem_types = [str(x).strip().lower() for x in (memory_types or []) if str(x).strip()]
+        valid_t = {MemoryType.event.value, MemoryType.fact.value, MemoryType.knowledge.value}
+        mem_types = [x for x in mem_types if x in valid_t]
+
+        expr_parts = [f"user_id == '{uid_expr}'"]
+        if mem_types:
+            ors = " or ".join(f"memory_type == '{_milvus_escape(t)}'" for t in mem_types)
+            expr_parts.append(f"({ors})")
+        if time_start is not None:
+            expr_parts.append(f"timestamp >= {int(time_start)}")
+        if time_end is not None:
+            expr_parts.append(f"timestamp <= {int(time_end)}")
+        expr = " and ".join(expr_parts)
+
+        search_limit = max(top_k * 2, top_k)
+        if ft or fc:
+            search_limit = max(top_k * 4, 32, top_k * 2)
+
+        vec = self._get_embedding(qt[:2048])
+        hits = col.search(
+            data=[vec],
+            anns_field="embedding",
+            param={"metric_type": "COSINE", "params": {"ef": search_ef}},
+            limit=search_limit,
+            expr=expr,
+            output_fields=["memory_id", "memory_type"],
+        )
+
+        seen_mid: set[str] = set()
+        ordered_mids: List[str] = []
+        for hit in hits[0]:
+            mid = hit.entity.get("memory_id")
+            if not mid:
+                continue
+            sid = str(mid)
+            if sid in seen_mid:
+                continue
+            seen_mid.add(sid)
+            ordered_mids.append(sid)
+            if len(ordered_mids) >= search_limit:
+                break
+
+        memories: List[Dict[str, Any]] = []
+        causal_chain: List[str] = []
 
         with self._driver.session() as session:
-            # 事实检索：以 Milvus 向量（ref_type=fact）为主，中文查询句；Neo4j 仅按命中 fact_id 回填 facts
-            if fact_keys or (
-                global_vector_fallback
-                and (global_vector_fallback.get("text") or "").strip()
-            ):
-                probe = _fact_vector_probe_text(fact_keys, global_vector_fallback)
-                fact_top_k = 12
-                log.info(
-                    "query_memory: Milvus 事实向量检索（主路径）top_k=%s probe_len=%s",
-                    fact_top_k,
-                    len(probe),
-                )
-                log.debug("query_memory: 事实 probe 预览=%r", probe[:240])
-                vec_facts = self._get_embedding(probe[:2048])
-                expr_fact = (
-                    f"user_id == '{uid_expr}' and ref_type == '{RefType.fact.value}'"
-                )
-                hits_fact = col.search(
-                    data=[vec_facts],
-                    anns_field="embedding",
-                    param={"metric_type": "COSINE", "params": {"ef": search_ef}},
-                    limit=fact_top_k,
-                    expr=expr_fact,
-                    output_fields=["text", "ref_id"],
-                )
-                log.info(
-                    "query_memory: Milvus 事实向量原始命中数=%d",
-                    len(hits_fact[0]),
-                )
-                fact_ids_hit: List[str] = []
-                for i, hit in enumerate(hits_fact[0]):
-                    t = hit.entity.get("text")
-                    fid = hit.entity.get("ref_id")
-                    log.debug(
-                        "  fact_vec[%d] distance=%s ref_id=%s text_preview=%r",
-                        i,
-                        getattr(hit, "distance", None),
-                        fid,
-                        (t or "")[:120],
+            resolved_keys: set[str] = set()
+            for mid in ordered_mids:
+                if len(memories) >= top_k:
+                    break
+                rec = session.run(
+                    """
+                    MATCH (m:Memory {memory_id: $mid})
+                    WHERE ($ft IS NULL OR m.tense = $ft)
+                      AND ($fc IS NULL OR m.confidence = $fc)
+                    RETURN m.content AS content, m.timestamp AS timestamp,
+                           m.memory_type AS memory_type, m.fact_key AS fact_key,
+                           m.tense AS tense, m.confidence AS confidence
+                    """,
+                    mid=mid,
+                    ft=ft,
+                    fc=fc,
+                ).single()
+                if not rec:
+                    continue
+                mtype = (rec.get("memory_type") or "").strip()
+                fk = rec.get("fact_key")
+
+                if mtype == MemoryType.fact.value:
+                    key = fk or self._parse_fact_key_from_stored_content(
+                        rec.get("content") or ""
                     )
-                    if t and t not in result["vector_chunks"]:
-                        result["vector_chunks"].append(t)
-                    if fid:
-                        fact_ids_hit.append(str(fid))
-                self._hydrate_facts_from_ref_ids(
-                    session, result, user_id, fact_ids_hit
-                )
-                log.info(
-                    "query_memory: 事实向量阶段结束 facts 条数=%d vector_chunks 条数=%d",
-                    len(result["facts"]),
-                    len(result["vector_chunks"]),
-                )
-
-            if event_query:
-                sem_text = event_query.get("semantic_text") or ""
-                t_start = event_query.get("time_start")
-                t_end = event_query.get("time_end")
-                entities = list(event_query.get("entities") or [])
-                top_k = int(event_query.get("top_k", 3))
-
-                vec = self._get_embedding(sem_text) if sem_text else self._get_embedding(
-                    "事件"
-                )
-                expr_parts = [
-                    f"user_id == '{uid_expr}'",
-                    f"ref_type == '{RefType.event.value}'",
-                ]
-                if t_start is not None:
-                    expr_parts.append(f"timestamp >= {int(t_start)}")
-                if t_end is not None:
-                    expr_parts.append(f"timestamp <= {int(t_end)}")
-                expr = " and ".join(expr_parts)
-                log.info(
-                    "query_memory: Milvus 事件向量检索 top_k=%s expr=%s",
-                    top_k,
-                    expr[:200],
-                )
-
-                hits = col.search(
-                    data=[vec],
-                    anns_field="embedding",
-                    param={"metric_type": "COSINE", "params": {"ef": search_ef}},
-                    limit=max(top_k * 2, top_k),
-                    expr=expr,
-                    output_fields=["ref_id"],
-                )
-                event_ids: List[str] = []
-                for hit in hits[0]:
-                    rid = hit.entity.get("ref_id")
-                    if rid and rid not in event_ids:
-                        event_ids.append(rid)
-
-                log.info(
-                    "query_memory: Milvus 事件向量原始命中数=%d 去重后 event_ids=%s",
-                    len(hits[0]),
-                    event_ids[:12],
-                )
-                for i, hit in enumerate(hits[0][:8]):
-                    log.debug(
-                        "  event_vec[%d] distance=%s ref_id=%s",
-                        i,
-                        getattr(hit, "distance", None),
-                        hit.entity.get("ref_id"),
-                    )
-
-                added = 0
-                for eid in event_ids:
-                    if added >= top_k:
-                        break
-                    ev = session.run(
-                        """
-                        MATCH (e:Event {event_id: $eid})
-                        OPTIONAL MATCH (e)-[:MENTIONS]->(ent:Entity)
-                        RETURN e.summary AS summary, e.time AS time, e.location AS location,
-                               e.subject AS subject, e.participants AS participants,
-                               e.action AS action, e.result AS result, e.tense AS tense,
-                               e.confidence AS confidence, collect(DISTINCT ent.name) AS entities
-                        """,
-                        eid=eid,
-                    ).single()
-                    if not ev:
-                        continue
-                    ent_list = [x for x in (ev["entities"] or []) if x]
-                    if entities and not any(e in ent_list for e in entities):
-                        continue
-                    row = {
-                        "summary": ev["summary"],
-                        "time": ev["time"],
-                        "location": ev["location"],
-                        "subject": ev["subject"],
-                        "participants": ev["participants"] or [],
-                        "action": ev["action"],
-                        "result": ev["result"],
-                        "tense": ev["tense"],
-                        "confidence": ev["confidence"],
-                        "entities": ent_list,
-                        "parents": self._parent_summaries(session, eid),
-                    }
-                    result["events"].append(row)
-                    chain = self._causal_chain_for_event(session, eid)
-                    if len(chain) > 1:
-                        result["causal_chains"].append(chain)
-                    parents = row.get("parents") or []
-                    for p in parents:
-                        if p and p not in result["parent_events"]:
-                            result["parent_events"].append(p)
-                    added += 1
-
-                log.info(
-                    "query_memory: 事件经 Neo4j 装配后写入条数=%d (Milvus 候选=%d, entities 过滤=%s)",
-                    len(result["events"]),
-                    len(event_ids),
-                    bool(entities),
-                )
-
-            if knowledge_query:
-                sem_text = knowledge_query.get("semantic_text") or ""
-                category = knowledge_query.get("category")
-                top_k = int(knowledge_query.get("top_k", 2))
-                vec = self._get_embedding(sem_text) if sem_text else self._get_embedding(
-                    "知识"
-                )
-                log.info(
-                    "query_memory: Milvus 知识向量检索 top_k=%s category=%r",
-                    top_k,
-                    category,
-                )
-                hits = col.search(
-                    data=[vec],
-                    anns_field="embedding",
-                    param={"metric_type": "COSINE", "params": {"ef": search_ef}},
-                    limit=max(top_k * 4, top_k),
-                    expr=(
-                        f"user_id == '{uid_expr}' and ref_type == '{RefType.knowledge.value}'"
-                    ),
-                    output_fields=["ref_id"],
-                )
-                for hit in hits[0]:
-                    if len(result["knowledge"]) >= top_k:
-                        break
-                    kid = hit.entity.get("ref_id")
-                    kn = session.run(
-                        """
-                        MATCH (k:Knowledge {knowledge_id: $kid})
-                        RETURN k.title AS title, k.content AS content, k.category AS category
-                        """,
-                        kid=kid,
-                    ).single()
-                    if not kn:
-                        continue
-                    if category and kn.get("category") != category:
-                        continue
-                    result["knowledge"].append(
-                        {"title": kn["title"], "content": kn["content"]}
-                    )
-
-        has_structured = bool(
-            result["facts"] or result["events"] or result["knowledge"]
-        )
-        fact_requested_but_empty = bool(fact_keys) and not result["facts"]
-        if global_vector_fallback:
-            text = (global_vector_fallback.get("text") or "").strip()
-            if text:
-                run_full_fallback = (not has_structured) or fact_requested_but_empty
-                if run_full_fallback:
-                    top_k = int(global_vector_fallback.get("top_k", 5))
-                    log.info(
-                        "query_memory: Milvus 全文兜底 触发 "
-                        "(无任何结构化=%s, 请求了fact_keys但facts仍空=%s) top_k=%s text_len=%s",
-                        not has_structured,
-                        fact_requested_but_empty,
-                        top_k,
-                        len(text),
-                    )
-                    vec = self._get_embedding(text)
-                    hits = col.search(
-                        data=[vec],
-                        anns_field="embedding",
-                        param={"metric_type": "COSINE", "params": {"ef": search_ef}},
-                        limit=top_k,
-                        expr=f"user_id == '{uid_expr}'",
-                        output_fields=["text", "ref_type", "ref_id"],
-                    )
-                    fallback_fact_ids: List[str] = []
-                    for i, hit in enumerate(hits[0]):
-                        t = hit.entity.get("text")
-                        rt = hit.entity.get("ref_type")
-                        rid = hit.entity.get("ref_id")
-                        log.debug(
-                            "query_memory: 全文兜底 hit[%d] distance=%s ref_type=%s ref_id=%s text_preview=%r",
-                            i,
-                            getattr(hit, "distance", None),
-                            rt,
-                            rid,
-                            (t or "")[:100],
+                    if key:
+                        if key in resolved_keys:
+                            continue
+                        resolved_keys.add(key)
+                        cur = self._current_fact_memory(
+                            session, user_id, key, ft, fc
                         )
-                        if t and t not in result["vector_chunks"]:
-                            result["vector_chunks"].append(t)
-                        if rt == RefType.fact.value and rid:
-                            fallback_fact_ids.append(str(rid))
-                    if fallback_fact_ids and self._driver is not None:
-                        with self._driver.session() as fb_session:
-                            self._hydrate_facts_from_ref_ids(
-                                fb_session, result, user_id, fallback_fact_ids
+                        if cur:
+                            memories.append(
+                                _memory_payload_from_record(cur, str(cur["memory_id"]))
                             )
+                        continue
+                    memories.append(_memory_payload_from_record(rec, mid))
+                    continue
 
-        if not result["causal_chains"]:
-            del result["causal_chains"]
-        if not result["parent_events"]:
-            del result["parent_events"]
+                memories.append(_memory_payload_from_record(rec, mid))
 
+            if memories and memories[0].get("memory_type") == MemoryType.event.value:
+                causal_chain = self._causal_chain_for_memory_event(
+                    session, memories[0]["memory_id"]
+                )
+
+        out: Dict[str, Any] = {"memories": memories}
+        if causal_chain:
+            out["causal_chain"] = causal_chain
         log.info(
-            "query_memory 完成 facts=%d events=%d knowledge=%d vector_chunks=%d",
-            len(result.get("facts") or {}),
-            len(result.get("events") or []),
-            len(result.get("knowledge") or []),
-            len(result.get("vector_chunks") or []),
+            "query_memory v5 完成 user_id=%s hits=%d memories_out=%d tense=%s confidence=%s",
+            user_id,
+            len(ordered_mids),
+            len(memories),
+            ft,
+            fc,
         )
-        return result
+        return out

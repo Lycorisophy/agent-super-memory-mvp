@@ -1,14 +1,10 @@
-# 复杂测试用例集（仅两个接口）
-# 用户维度 = 环境变量 DEFAULT_USER_ID，未设置时为 default；所有请求共享同一用户分区。
-# 建议：同一小节内自上而下执行，跨小节可先跑「基础种子数据」再跑查询类用例。
-
 @memoryApi = http://127.0.0.1:8000
 
 ###############################################################################
-# 基础种子数据（可先执行一遍，供后续查询用例命中）
+# 第一部分：基础种子数据（构建记忆库）
 ###############################################################################
 
-### 种子-1：单事件 + 单事实（简单基线）
+### 种子-1：基础事件与事实
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -18,17 +14,17 @@ Content-Type: application/json
 
 ###
 
-### 种子-2：长叙述：多事实 + 偏好 + 地点 + 时间混排
+### 种子-2：多事实与偏好（含数字、地点、否定偏好）
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
 {
-  "input": "帮我记下来：我在杭州滨江上班，公司叫星云科技，工位靠窗。咖啡只喝冰美式不加糖。家里猫叫汤圆，两岁。我手机号后四位是 6021。周末一般徒步或骑车，不喜欢健身房。"
+  "input": "帮我记下来：我在杭州滨江上班，公司叫星云科技，工位靠窗。咖啡只喝冰美式不加糖。家里猫叫汤圆，两岁。我手机号后四位是6021。周末一般徒步或骑车，不喜欢健身房。"
 }
 
 ###
 
-### 种子-3：同一轮里过去事件 + 未来计划 + 一条可复用知识
+### 种子-3：过去事件 + 未来计划 + 一条知识
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -38,7 +34,7 @@ Content-Type: application/json
 
 ###
 
-### 种子-4：因果链叙事（便于模型建 CAUSED / 先后关系）
+### 种子-4：因果链叙事（车窗未关导致霉味）
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -48,7 +44,7 @@ Content-Type: application/json
 
 ###
 
-### 种子-5：工作场景多人参与 + 会议结果
+### 种子-5：多人参与会议结论
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -58,7 +54,7 @@ Content-Type: application/json
 
 ###
 
-### 种子-6：更正类事实（城市从 A 到 B，测覆盖或新事实）
+### 种子-6：事实更正（常住地从杭州变为苏州）
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -68,51 +64,91 @@ Content-Type: application/json
 
 ###
 
-### 种子-7：医疗/忌口类（敏感信息风格，测结构化 key）
+### 种子-7：医疗忌口与健康事实
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
 {
-  "input": "健康方面帮我记：我对青霉素过敏；体检显示轻度脂肪肝，医生建议少油少糖；我目前在吃维生素 D，每天一粒。"
+  "input": "健康方面帮我记：我对青霉素过敏；体检显示轻度脂肪肝，医生建议少油少糖；我目前在吃维生素D，每天一粒。"
 }
 
 ###
 
-### 种子-8：纯知识无个人事件（看模型是否只写 knowledge）
+### 种子-8：纯知识（无个人事件）
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
 {
-  "input": "存一条通用知识：PostgreSQL 里查看当前连接的命令是 SELECT pid, usename, application_name FROM pg_stat_activity; 分类算数据库。"
+  "input": "存一条通用知识：PostgreSQL里查看当前连接的命令是 SELECT pid, usename, application_name FROM pg_stat_activity; 分类算数据库。"
 }
 
 ###
 
-### 种子-9：子事件与父事件语言描述（SUB_EVENT_OF 倾向）
+### 种子-9：子事件与父事件（生日聚会各环节）
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
 {
-  "input": "我办了一场生日聚会：整件事是生日聚会；其中子环节包括在餐厅订了包间、朋友帮忙布置气球、后来转场去 KTV 唱歌到十二点。请按父子事件组织如能识别。"
+  "input": "我办了一场生日聚会：整件事是生日聚会；其中子环节包括在餐厅订了包间、朋友帮忙布置气球、后来转场去KTV唱歌到十二点。请按父子事件组织如能识别。"
 }
 
 ###
 
-### 种子-10：情绪与置信度（ imagined / planned 等）
+### 种子-10：梦境（虚拟语气）与未来计划
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
 {
-  "input": "我梦见自己中了彩票请当 imagined 类事件记一条就好。另外我计划明年换一辆混动 SUV，这是真实打算，可以记 planned。"
+  "input": "我梦见自己中了彩票——请当作 imagined 类事件记一条就好。另外我计划明年换一辆混动SUV，这是真实打算，可以记 planned。"
+}
+
+###
+
+### 种子-11：瞎编事实测试（应被LLM拒绝或标记为低置信度）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "顺便说一下，我是火星移民过来的，今年已经250岁了，有三只眼睛。"
+}
+
+###
+
+### 种子-12：指代消解测试（需要理解“她”是谁）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "李丽是我老婆。她最喜欢的颜色是蓝色，生日是5月20号。"
+}
+
+###
+
+### 种子-13：虚拟条件句（不是真实事件，不应存储）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "如果明天不下雨，我可能会去爬山。不过这只是随便说说，不一定真去。"
+}
+
+###
+
+### 种子-14：过时知识的明确声明
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "我之前以为煮饺子要盖锅盖，后来发现不盖煮皮才更筋道。把正确的记住，旧的删掉或标记过时。"
 }
 
 ###
 
 ###############################################################################
-# 查询 / 提取（复杂问法、多意图、模糊与时间）
+# 第二部分：查询用例（复杂问法、边界测试）
 ###############################################################################
 
-### 查询-1：多跳事实组合（配偶 + 购物地点）
+### 查询-1：多跳事实组合
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -120,8 +156,9 @@ Content-Type: application/json
   "input": "我之前说过我配偶叫什么名字？我们还在哪买过排骨？"
 }
 
+###
 
-### 查询-2：工作 + 人名 + 结论摘要
+### 查询-2：工作结论与人名
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -131,7 +168,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-3：模糊语义 + 实体（猫、咖啡）
+### 查询-3：模糊语义（猫、咖啡）
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -141,7 +178,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-4：常住地更正后验证
+### 查询-4：过时事实覆盖验证
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -151,7 +188,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-5：健康忌口组合问
+### 查询-5：健康忌口组合
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -161,7 +198,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-6：知识类「怎么做」
+### 查询-6：知识检索
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -171,7 +208,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-7：车辆因果链回忆（霉味、车窗等）
+### 查询-7：因果链回忆
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -181,7 +218,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-8：时间相对口语「上周三」类
+### 查询-8：相对时间口语
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -191,7 +228,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-9：一长句多子问题（压力测路由）
+### 查询-9：多子问题压力测试
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -201,17 +238,17 @@ Content-Type: application/json
 
 ###
 
-### 查询-10：技术知识是否入库
+### 查询-10：技术知识原文召回
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
 {
-  "input": "我有没有存过和 PostgreSQL 查看连接有关的命令？有的话原文是什么？"
+  "input": "我有没有存过和PostgreSQL查看连接有关的命令？有的话原文是什么？"
 }
 
 ###
 
-### 查询-11：生日聚会子环节
+### 查询-11：子事件查询
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -221,7 +258,7 @@ Content-Type: application/json
 
 ###
 
-### 查询-12：计划类 vs 梦见类区分
+### 查询-12：计划类与梦境类区分
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -231,7 +268,47 @@ Content-Type: application/json
 
 ###
 
-### 查询-13：纯寒暄（模型可能不调 query_memory）
+### 查询-13：指代消解查询（需要理解“她”指李丽）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "李丽的生日是哪天？她最喜欢什么颜色？"
+}
+
+###
+
+### 查询-14：虚拟条件句不应被记住
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我是不是说过明天要去爬山？"
+}
+
+###
+
+### 查询-15：瞎编事实不应被召回
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我有没有说过我是火星人或者多少岁？"
+}
+
+###
+
+### 查询-16：过时知识覆盖验证
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "煮饺子到底要不要盖锅盖？我记录的正确做法是什么？"
+}
+
+###
+
+### 查询-17：纯寒暄（不调用工具）
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -242,10 +319,10 @@ Content-Type: application/json
 ###
 
 ###############################################################################
-# 追加写入后再查（依赖上文种子，可重复跑观察幂等/覆盖）
+# 第三部分：追加写入后验证（覆盖/更新）
 ###############################################################################
 
-### 追加-1：同一 key 再写事实（如城市、咖啡）
+### 追加-1：咖啡偏好更新
 POST {{memoryApi}}/memory/conversation/store
 Content-Type: application/json
 
@@ -255,7 +332,7 @@ Content-Type: application/json
 
 ###
 
-### 追加-2：查询看咖啡是否更新
+### 追加-2：查询咖啡偏好是否更新
 POST {{memoryApi}}/memory/conversation/query
 Content-Type: application/json
 
@@ -264,3 +341,21 @@ Content-Type: application/json
 }
 
 ###
+
+### 追加-3：会议结论修正（覆盖）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "关于需求评审会的结论更正一下：支付对接也放到一期了，由赵敏负责。"
+}
+
+###
+
+### 追加-4：查询会议结论修正结果
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "现在一期的范围到底包含支付对接吗？谁负责支付？"
+}
