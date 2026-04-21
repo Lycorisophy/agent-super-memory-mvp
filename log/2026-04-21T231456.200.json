@@ -1,0 +1,23 @@
+{
+  "reply": "已为您存储 2 条记忆：\n\n1. **事实**：您的配偶叫李丽\n2. **事件**：上周六（2026-04-18）在沃尔玛购买了排骨",
+  "tool_called": true,
+  "tool_results": [
+    {
+      "tool": "store_memory",
+      "result": {
+        "error": "'str' object has no attribute 'get'"
+      }
+    },
+    {
+      "tool": "store_memory",
+      "result": {
+        "success": true,
+        "memory_ids": [
+          "mem_304998403081900032",
+          "mem_304998403220312064"
+        ],
+        "message": "已存储 2 条记忆"
+      }
+    }
+  ]
+}
