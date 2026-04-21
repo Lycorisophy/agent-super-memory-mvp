@@ -1,0 +1,266 @@
+# 复杂测试用例集（仅两个接口）
+# 用户维度 = 环境变量 DEFAULT_USER_ID，未设置时为 default；所有请求共享同一用户分区。
+# 建议：同一小节内自上而下执行，跨小节可先跑「基础种子数据」再跑查询类用例。
+
+@memoryApi = http://127.0.0.1:8000
+
+###############################################################################
+# 基础种子数据（可先执行一遍，供后续查询用例命中）
+###############################################################################
+
+### 种子-1：单事件 + 单事实（简单基线）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "记一下：我配偶叫李丽，上周六我们在沃尔玛买了排骨。"
+}
+
+###
+
+### 种子-2：长叙述：多事实 + 偏好 + 地点 + 时间混排
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "帮我记下来：我在杭州滨江上班，公司叫星云科技，工位靠窗。咖啡只喝冰美式不加糖。家里猫叫汤圆，两岁。我手机号后四位是 6021。周末一般徒步或骑车，不喜欢健身房。"
+}
+
+###
+
+### 种子-3：同一轮里过去事件 + 未来计划 + 一条可复用知识
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "上周三晚上我在家厨房试着做红烧肉，糖色炒过了有点苦，最后倒掉了——记成过去的事。另外我打算下周五去上海出差三天，住虹桥附近，这是计划。还有一条小知识：煮饺子水里加一点盐皮更不容易破。"
+}
+
+###
+
+### 种子-4：因果链叙事（便于模型建 CAUSED / 先后关系）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "记录车辆相关一串事：下暴雨那天我忘关车窗，后来座椅全湿了；过了几天车里出现霉味；我把车送去精洗并开了除湿，现在味道小多了。如果合适请用关系表达因果和先后顺序。"
+}
+
+###
+
+### 种子-5：工作场景多人参与 + 会议结果
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "2026年4月10日下午，我和同事王强、赵敏在公司大会议室跟客户张总开了两小时需求评审会，结论是：一期先上订单模块和报表，支付对接放到二期；我负责接口文档，王强负责前端排期。"
+}
+
+###
+
+### 种子-6：更正类事实（城市从 A 到 B，测覆盖或新事实）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "更新我的常住地：我已经从杭州搬到苏州了，大概三月底搬完的，以后默认说我在苏州。"
+}
+
+###
+
+### 种子-7：医疗/忌口类（敏感信息风格，测结构化 key）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "健康方面帮我记：我对青霉素过敏；体检显示轻度脂肪肝，医生建议少油少糖；我目前在吃维生素 D，每天一粒。"
+}
+
+###
+
+### 种子-8：纯知识无个人事件（看模型是否只写 knowledge）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "存一条通用知识：PostgreSQL 里查看当前连接的命令是 SELECT pid, usename, application_name FROM pg_stat_activity; 分类算数据库。"
+}
+
+###
+
+### 种子-9：子事件与父事件语言描述（SUB_EVENT_OF 倾向）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "我办了一场生日聚会：整件事是生日聚会；其中子环节包括在餐厅订了包间、朋友帮忙布置气球、后来转场去 KTV 唱歌到十二点。请按父子事件组织如能识别。"
+}
+
+###
+
+### 种子-10：情绪与置信度（ imagined / planned 等）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "我梦见自己中了彩票请当 imagined 类事件记一条就好。另外我计划明年换一辆混动 SUV，这是真实打算，可以记 planned。"
+}
+
+###
+
+###############################################################################
+# 查询 / 提取（复杂问法、多意图、模糊与时间）
+###############################################################################
+
+### 查询-1：多跳事实组合（配偶 + 购物地点）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我之前说过我配偶叫什么名字？我们还在哪买过排骨？"
+}
+
+
+### 查询-2：工作 + 人名 + 结论摘要
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "那次跟张总的需求评审里，一期到底要做哪些模块？谁负责接口文档？"
+}
+
+###
+
+### 查询-3：模糊语义 + 实体（猫、咖啡）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我家宠物叫什么、多大？还有我喝咖啡有什么固定习惯？"
+}
+
+###
+
+### 查询-4：常住地更正后验证
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我现在常住哪个城市？我有没有说过从哪搬到哪？"
+}
+
+###
+
+### 查询-5：健康忌口组合问
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我有没有药物过敏？体检和医嘱里关于脂肪肝说过什么？"
+}
+
+###
+
+### 查询-6：知识类「怎么做」
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "你记忆里有没有关于煮饺子不容易破的技巧？具体怎么说的？"
+}
+
+###
+
+### 查询-7：车辆因果链回忆（霉味、车窗等）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我车里后来有霉味可能和什么事有关？中间还发生过什么？"
+}
+
+###
+
+### 查询-8：时间相对口语「上周三」类
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我有没有说过某次在家做红烧肉搞砸了的事？大概什么时候？"
+}
+
+###
+
+### 查询-9：一长句多子问题（压力测路由）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "帮我回忆：我公司在哪、我工位特点、猫名字、咖啡偏好、手机号后四位——能想起多少说多少，记不清就说记不清。"
+}
+
+###
+
+### 查询-10：技术知识是否入库
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我有没有存过和 PostgreSQL 查看连接有关的命令？有的话原文是什么？"
+}
+
+###
+
+### 查询-11：生日聚会子环节
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我生日聚会大概有哪些环节？有没有转场去唱歌？"
+}
+
+###
+
+### 查询-12：计划类 vs 梦见类区分
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我有没有说过换车的打算？另外我有没有记录过跟彩票有关的梦？"
+}
+
+###
+
+### 查询-13：纯寒暄（模型可能不调 query_memory）
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "今天天气真不错，随便聊两句，不用翻我记忆也行。"
+}
+
+###
+
+###############################################################################
+# 追加写入后再查（依赖上文种子，可重复跑观察幂等/覆盖）
+###############################################################################
+
+### 追加-1：同一 key 再写事实（如城市、咖啡）
+POST {{memoryApi}}/memory/conversation/store
+Content-Type: application/json
+
+{
+  "input": "再更新一下：我现在咖啡改成喝热拿铁了，偶尔才喝冰美式。"
+}
+
+###
+
+### 追加-2：查询看咖啡是否更新
+POST {{memoryApi}}/memory/conversation/query
+Content-Type: application/json
+
+{
+  "input": "我现在到底更喜欢喝哪种咖啡？有没有更新记录？"
+}
+
+###
