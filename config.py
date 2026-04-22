@@ -32,5 +32,8 @@ class Settings(BaseSettings):
     # 自然语言「单参数」接口使用的默认用户维度（Milvus/Neo4j 分区）
     default_user_id: str = "default"
 
+    # 结构化查询助手：目标 MySQL（须使用只读账号），如 mysql+pymysql://user:pass@host:3306/db
+    mysql_url: str = "mysql+pymysql://ai_agent:readonly@localhost:3306/agent_schema_demo"
+
 
 settings = Settings()

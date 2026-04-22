@@ -1,6 +1,6 @@
 # Agent Super Memory MVP
 
-基于 **Milvus（向量）+ Neo4j（图）** 的长期记忆服务。实现与 **[design.md](design.md) v4.0** 及 **[长期记忆系统 v5.0 增量修改文档（相对 v4.0）.md](长期记忆系统%20v5.0%20增量修改文档（相对%20v4.0）.md)** 对齐：**单一 `:Memory` 节点**、**统一中文模板 `content`**；工具 **`memories` + `relations`（temp_id）** 与 **`query_text` + `memory_types`**；v5 起 Neo4j 侧支持可选 **`tense` / `confidence`** 及查询过滤（Milvus 结构不变）。
+基于 **Milvus（向量）+ Neo4j（图）** 的长期记忆服务。实现与 **[design.md](docs/长期记忆系统详细设计文档 v4.0.md) v4.0** 及 **[长期记忆系统 v5.0 增量修改文档（相对 v4.0）.md](长期记忆系统%20v5.0%20增量修改文档（相对%20v4.0）.md)** 对齐：**单一 `:Memory` 节点**、**统一中文模板 `content`**；工具 **`memories` + `relations`（temp_id）** 与 **`query_text` + `memory_types`**；v5 起 Neo4j 侧支持可选 **`tense` / `confidence`** 及查询过滤（Milvus 结构不变）。
 
 对外暴露 **两个 HTTP 接口**：用户自然语言 → 服务端组装系统提示词与工具定义 → **Ollama** 触发 `store_memory` / `query_memory` → 后端写入/检索 → 返回模型自然语言回复。
 

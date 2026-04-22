@@ -1,6 +1,6 @@
 """
 通过本地 Ollama 对话：系统提示词 + 工具定义 + 用户一句输入 → 工具执行 → 模型自然语言回复。
-提示词与工具 schema 对齐 design.md v4 与 v5.0 增量（tense / confidence）。
+提示词与工具 schema 对齐 长期记忆系统详细设计文档 v4.0.md v4 与 v5.0 增量（tense / confidence）。
 """
 from __future__ import annotations
 

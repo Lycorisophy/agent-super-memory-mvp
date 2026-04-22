@@ -1,5 +1,5 @@
 """
-长期记忆存储与查询（Milvus + Neo4j），实现见 design.md v4.0 + v5.0 增量（:Memory 上 tense/confidence）。
+长期记忆存储与查询（Milvus + Neo4j），实现见 长期记忆系统详细设计文档 v4.0.md v4.0 + v5.0 增量（:Memory 上 tense/confidence）。
 旧版 memory_chunks / Event·Fact·Knowledge 与 v4 不兼容，需使用新集合名与新 Neo4j 约束。
 """
 from __future__ import annotations
@@ -166,7 +166,7 @@ def _build_unified_memory_content(
     core_content: str,
     source: str,
 ) -> str:
-    """design.md §2.1 统一中文模板。"""
+    """长期记忆系统详细设计文档 v4.0.md §2.1 统一中文模板。"""
     type_cn = _MEMORY_TYPE_CN.get(memory_type, memory_type)
     lines = [
         f"【类型】{type_cn}",

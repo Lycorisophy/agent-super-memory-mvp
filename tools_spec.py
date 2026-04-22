@@ -1,4 +1,4 @@
-"""OpenAI 风格 function tools，与 design.md v4 + v5.0 增量工具定义一致。"""
+"""OpenAI 风格 function tools，与 长期记忆系统详细设计文档 v4.0.md v4 + v5.0 增量工具定义一致。"""
 from typing import Any, Dict
 
 STORE_MEMORY_TOOL: Dict[str, Any] = {
