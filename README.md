@@ -79,7 +79,7 @@ python -m pytest tests/test_dialogue_store_unit.py tests/test_unified_dialogue_a
 
 ### 统一对话 ReAct（单接口）
 
-- `POST /memory/conversation/unified` — 请求体：`input`（本轮）、可选 `include_trace`、`max_steps`；从 MySQL 读最近 `DIALOGUE_FETCH_LIMIT` 条上下文，内部 ReAct 组合 `store_memory` / `query_memory` / `fetch_older_chat`（若永驻库可用则另有 `update_permanent_memory`）；同步返回 `final_answer`；**本轮 user/assistant 两行在响应后由后台任务异步写入**（失败仅打日志）。
+- `POST /memory/conversation/unified` — 请求体：`input`（本轮）、可选 `include_trace`、`max_steps`；从 MySQL 读最近 `DIALOGUE_FETCH_LIMIT` 条上下文，内部 ReAct 组合 `store_memory` / `query_memory` / `fetch_older_chat`（若永驻库可用则另有 `update_permanent_memory`）；同步返回 `final_answer`；**本轮 user/assistant 两行在响应后由后台任务异步写入**（失败仅打日志）。**详细设计**见 [`docs/统一对话永不忘助手详细设计.md`](docs/统一对话永不忘助手详细设计.md)。
 
 详见 [`test_main.http`](test_main.http)。
 
