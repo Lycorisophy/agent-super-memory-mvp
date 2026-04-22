@@ -35,5 +35,23 @@ class Settings(BaseSettings):
     # 结构化查询助手：目标 MySQL（须使用只读账号），如 mysql+pymysql://user:pass@host:3306/db
     mysql_url: str = "mysql+pymysql://ai_agent:readonly@localhost:3306/agent_schema_demo"
 
+    # 统一对话 ReAct：对话消息表（须 SELECT + INSERT；可与 mysql_url 同库但账号需写权限）
+    # 空字符串表示沿用 mysql_url（请确保该账号具备 INSERT 权限）
+    mysql_dialogue_url: str = ""
+    dialogue_table: str = "chat_messages"
+    dialogue_col_id: str = "id"
+    dialogue_col_user_id: str = "user_id"
+    dialogue_col_role: str = "role"
+    dialogue_col_content: str = "content"
+    dialogue_col_created_at: str = "created_at"
+    dialogue_fetch_limit: int = 10
+    dialogue_older_fetch_max: int = 20
+    # 统一对话 ReAct：默认步数与硬上限（含工具步与 final_answer）
+    unified_dialogue_max_steps: int = 5
+    unified_dialogue_max_steps_cap: int = 8
+
+    # 永驻记忆（与对话库同一 MySQL 连接策略；须 SELECT + INSERT/UPDATE）
+    permanent_memory_table: str = "permanent_memory"
+
 
 settings = Settings()

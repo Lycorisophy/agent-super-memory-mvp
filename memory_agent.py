@@ -8,13 +8,14 @@ import json
 import logging
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 import ollama
 
 from config import settings
 from memory_service import MemorySystem
-from tools_spec import QUERY_MEMORY_TOOL, STORE_MEMORY_TOOL
+from permanent_memory_store import PermanentMemoryStore
+from tools_spec import QUERY_MEMORY_TOOL, STORE_MEMORY_TOOL, UPDATE_PERMANENT_MEMORY_TOOL
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +118,11 @@ def _tool_call_iter(message: Any) -> List[tuple[str, Dict[str, Any]]]:
 
 
 def _run_tool(
-    mem: MemorySystem, name: str, args: Dict[str, Any], trace: str
+    mem: MemorySystem,
+    name: str,
+    args: Dict[str, Any],
+    trace: str,
+    perm_store: Optional[PermanentMemoryStore] = None,
 ) -> Dict[str, Any]:
     args = dict(args)
     args["user_id"] = settings.default_user_id
@@ -178,6 +183,17 @@ def _run_tool(
                 tense=args.get("tense"),
                 confidence=args.get("confidence"),
             )
+        if name == "update_permanent_memory":
+            if perm_store is None:
+                return {"success": False, "error": "永驻记忆服务不可用"}
+            val = args.get("value", "")
+            if not isinstance(val, str):
+                val = str(val) if val is not None else ""
+            return perm_store.upsert(
+                args["user_id"],
+                str(args.get("category") or ""),
+                val,
+            )
         return {"error": f"未知工具: {name}"}
     except Exception as e:
         log.warning("%s 工具 %s 异常: %s", trace, name, e)
@@ -191,6 +207,7 @@ def _run_loop(
     system: str,
     allowed: Set[str],
     trace: str,
+    perm_store: Optional[PermanentMemoryStore] = None,
 ) -> Dict[str, Any]:
     client = ollama.Client(host=settings.ollama_base_url)
     model = settings.ollama_chat_model
@@ -244,7 +261,7 @@ def _run_loop(
                 }
                 log.warning("%s 拒绝工具 %s（不在白名单）", trace, name)
             else:
-                result = _run_tool(mem, name, args, trace)
+                result = _run_tool(mem, name, args, trace, perm_store=perm_store)
             err = result.get("error") if isinstance(result, dict) else None
             log.info(
                 "%s 工具 %s 返回 keys=%s error=%s",
@@ -276,29 +293,59 @@ def _run_loop(
     }
 
 
-def run_store_assistant(mem: MemorySystem, user_input: str) -> Dict[str, Any]:
+def run_store_assistant(
+    mem: MemorySystem,
+    user_input: str,
+    *,
+    perm_store: Optional[PermanentMemoryStore] = None,
+) -> Dict[str, Any]:
     uid = settings.default_user_id
     ct = datetime.now().strftime("%Y-%m-%d %H:%M")
-    system = STORE_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
+    core = STORE_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
+    if perm_store:
+        prefix = perm_store.format_prompt_block(uid) + "\n\n"
+        tools: List[Dict[str, Any]] = [STORE_MEMORY_TOOL, UPDATE_PERMANENT_MEMORY_TOOL]
+        allowed: Set[str] = {"store_memory", "update_permanent_memory"}
+    else:
+        prefix = ""
+        tools = [STORE_MEMORY_TOOL]
+        allowed = {"store_memory"}
+    system = prefix + core
     return _run_loop(
         mem,
         user_input,
-        tools=[STORE_MEMORY_TOOL],
+        tools=tools,
         system=system,
-        allowed={"store_memory"},
+        allowed=allowed,
         trace="[store]",
+        perm_store=perm_store,
     )
 
 
-def run_query_assistant(mem: MemorySystem, user_input: str) -> Dict[str, Any]:
+def run_query_assistant(
+    mem: MemorySystem,
+    user_input: str,
+    *,
+    perm_store: Optional[PermanentMemoryStore] = None,
+) -> Dict[str, Any]:
     uid = settings.default_user_id
     ct = datetime.now().strftime("%Y-%m-%d %H:%M")
-    system = QUERY_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
+    core = QUERY_SYSTEM_TEMPLATE.format(user_id=uid, current_time=ct)
+    if perm_store:
+        prefix = perm_store.format_prompt_block(uid) + "\n\n"
+        tools = [QUERY_MEMORY_TOOL, UPDATE_PERMANENT_MEMORY_TOOL]
+        allowed = {"query_memory", "update_permanent_memory"}
+    else:
+        prefix = ""
+        tools = [QUERY_MEMORY_TOOL]
+        allowed = {"query_memory"}
+    system = prefix + core
     return _run_loop(
         mem,
         user_input,
-        tools=[QUERY_MEMORY_TOOL],
+        tools=tools,
         system=system,
-        allowed={"query_memory"},
+        allowed=allowed,
         trace="[query]",
+        perm_store=perm_store,
     )

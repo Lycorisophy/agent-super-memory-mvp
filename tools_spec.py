@@ -130,3 +130,34 @@ QUERY_MEMORY_TOOL: Dict[str, Any] = {
         },
     },
 }
+
+UPDATE_PERMANENT_MEMORY_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "update_permanent_memory",
+        "description": (
+            "更新当前用户在 MySQL 中的永驻记忆（三选一：用户身份、智能体性格、工作规范）。"
+            "每项最多 1000 字；超长则更新失败。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "用户唯一标识（服务端会强制为当前默认用户）",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["用户身份", "智能体性格", "工作规范"],
+                    "description": "要更新的永驻记忆类别",
+                },
+                "value": {
+                    "type": "string",
+                    "maxLength": 1000,
+                    "description": "该类别的完整文本内容，最多 1000 字",
+                },
+            },
+            "required": ["user_id", "category", "value"],
+        },
+    },
+}
